@@ -178,8 +178,10 @@ func formatToolText(name string, value map[string]any) string {
 		stdout := mapField(value, "stdout")
 		stderr := mapField(value, "stderr")
 		return fmt.Sprintf(
-			"job: %.0f\n\nstdout (%s):\n%s\n\nstderr (%s):\n%s",
+			"job: %.0f\nstdoutNextOffset: %.0f\nstderrNextOffset: %.0f\n\nstdout (%s):\n%s\n\nstderr (%s):\n%s",
 			numberOrZero(value, "jobId"),
+			numberOrZero(stdout, "nextOffset"),
+			numberOrZero(stderr, "nextOffset"),
 			stringField(stdout, "encoding"),
 			stringField(stdout, "data"),
 			stringField(stderr, "encoding"),
@@ -224,8 +226,10 @@ func formatToolText(name string, value map[string]any) string {
 			text += "\nterminationSource: " + source
 		}
 		return fmt.Sprintf(
-			"%s\n\nstdout (%s):\n%s\n\nstderr (%s):\n%s",
+			"%s\nstdoutNextOffset: %.0f\nstderrNextOffset: %.0f\n\nstdout (%s):\n%s\n\nstderr (%s):\n%s",
 			text,
+			numberOrZero(stdout, "nextOffset"),
+			numberOrZero(stderr, "nextOffset"),
 			stringField(stdout, "encoding"),
 			stringField(stdout, "data"),
 			stringField(stderr, "encoding"),
@@ -331,6 +335,23 @@ func idProperty(description string) map[string]any {
 	}
 }
 
+func outputCursorProperty(stream string) map[string]any {
+	return map[string]any{
+		"type":        "integer",
+		"description": fmt.Sprintf("Optional absolute %s byte offset returned as nextOffset by the previous read. When provided, only newer retained output is returned.", stream),
+		"minimum":     0,
+		"maximum":     int64(^uint64(0) >> 1),
+	}
+}
+
+func streamReadSchema(idName, idDescription string) map[string]any {
+	return objectSchema(map[string]any{
+		idName:        idProperty(idDescription),
+		"stdoutAfter": outputCursorProperty("stdout"),
+		"stderrAfter": outputCursorProperty("stderr"),
+	}, idName)
+}
+
 func toolSpecs() []toolSpec {
 	empty := func() map[string]any { return objectSchema(map[string]any{}) }
 	jobID := func(description string) map[string]any {
@@ -389,8 +410,8 @@ func toolSpecs() []toolSpec {
 		},
 		{
 			Name:        "job_logs",
-			Description: "Return the captured stdout and stderr tail of a background job.",
-			InputSchema: jobID("ID of the background job."),
+			Description: "Return captured stdout and stderr from a background job. Optional stdoutAfter/stderrAfter cursors request only output newer than the previous read.",
+			InputSchema: streamReadSchema("jobId", "ID of the background job."),
 			ReadOnly:    true,
 		},
 		{
@@ -431,8 +452,8 @@ func toolSpecs() []toolSpec {
 		},
 		{
 			Name:        "shell_read",
-			Description: "Return the current bounded stdout and stderr tails of a persistent shell session.",
-			InputSchema: shellID("ID of the persistent shell session."),
+			Description: "Read stdout and stderr from a persistent shell session. Optional stdoutAfter/stderrAfter cursors request only output newer than the previous read.",
+			InputSchema: streamReadSchema("shellId", "ID of the persistent shell session."),
 			ReadOnly:    true,
 		},
 		{
