@@ -1,0 +1,4 @@
+/zshell-gateway
+/zshell-gateway.exe
+*.log
+.env
