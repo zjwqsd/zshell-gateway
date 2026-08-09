@@ -261,6 +261,50 @@ func formatToolText(name string, value map[string]any) string {
 			b.WriteByte('\n')
 		}
 		return b.String()
+	case "file_stat":
+		return fmt.Sprintf(
+			"path: %s\nkind: %s\nsize: %.0f bytes\nmtimeMs: %.0f",
+			stringField(value, "path"),
+			stringField(value, "kind"),
+			numberOrZero(value, "size"),
+			numberOrZero(value, "mtimeMs"),
+		)
+	case "file_list":
+		entries, _ := value["entries"].([]any)
+		var b strings.Builder
+		fmt.Fprintf(&b, "path: %s\nnextOffset: %.0f\neof: %t\n",
+			stringField(value, "path"), numberOrZero(value, "nextOffset"), boolField(value, "eof"))
+		for _, raw := range entries {
+			entry, _ := raw.(map[string]any)
+			fmt.Fprintf(&b, "%s\t%s", stringField(entry, "kind"), stringField(entry, "name"))
+			if size, ok := numberField(entry, "size"); ok {
+				fmt.Fprintf(&b, "\t%.0f bytes", size)
+			}
+			b.WriteByte('\n')
+		}
+		return b.String()
+	case "file_read":
+		content := mapField(value, "content")
+		return fmt.Sprintf(
+			"path: %s\nsize: %.0f\noffset: %.0f\nnextOffset: %.0f\neof: %t\nencoding: %s\n\n%s",
+			stringField(value, "path"),
+			numberOrZero(value, "size"),
+			numberOrZero(value, "offset"),
+			numberOrZero(value, "nextOffset"),
+			boolField(value, "eof"),
+			stringField(content, "encoding"),
+			stringField(content, "data"),
+		)
+	case "file_write":
+		return fmt.Sprintf(
+			"path: %s\nbytesWritten: %.0f\nsize: %.0f\nappended: %t",
+			stringField(value, "path"),
+			numberOrZero(value, "bytesWritten"),
+			numberOrZero(value, "size"),
+			boolField(value, "appended"),
+		)
+	case "file_mkdir":
+		return fmt.Sprintf("path: %s\nrecursive: %t", stringField(value, "path"), boolField(value, "recursive"))
 	default:
 		encoded, _ := json.Marshal(value)
 		return string(encoded)
@@ -332,6 +376,23 @@ func idProperty(description string) map[string]any {
 		"description": description,
 		"minimum":     1,
 		"maximum":     int64(^uint64(0) >> 1),
+	}
+}
+
+func pathProperty(description string) map[string]any {
+	return map[string]any{
+		"type":        "string",
+		"description": description,
+		"minLength":   1,
+	}
+}
+
+func nonNegativeIntegerProperty(description string, maximum int64) map[string]any {
+	return map[string]any{
+		"type":        "integer",
+		"description": description,
+		"minimum":     0,
+		"maximum":     maximum,
 	}
 }
 
@@ -466,6 +527,64 @@ func toolSpecs() []toolSpec {
 			Description: "List persistent shell sessions managed by zshell.",
 			InputSchema: empty(),
 			ReadOnly:    true,
+		},
+		{
+			Name:        "file_stat",
+			Description: "Return metadata for a file-system path without reading its contents.",
+			InputSchema: objectSchema(map[string]any{
+				"path": pathProperty("File or directory path. Relative paths are resolved from the zshell workspace."),
+			}, "path"),
+			ReadOnly: true,
+		},
+		{
+			Name:        "file_list",
+			Description: "List entries in a directory. Supports bounded pagination by entry offset.",
+			InputSchema: objectSchema(map[string]any{
+				"path":   pathProperty("Directory path. Defaults to the zshell workspace."),
+				"offset": nonNegativeIntegerProperty("Entry offset to start from. Defaults to 0.", int64(^uint64(0)>>1)),
+				"maxEntries": map[string]any{
+					"type": "integer", "description": "Maximum entries to return. Defaults to 200.", "minimum": 1, "maximum": 1000,
+				},
+			}),
+			ReadOnly: true,
+		},
+		{
+			Name:        "file_read",
+			Description: "Read a bounded byte range from a file. UTF-8 is returned directly; arbitrary binary data is returned as base64.",
+			InputSchema: objectSchema(map[string]any{
+				"path":   pathProperty("File path to read."),
+				"offset": nonNegativeIntegerProperty("Absolute byte offset to start reading from. Defaults to 0.", int64(^uint64(0)>>1)),
+				"maxBytes": map[string]any{
+					"type": "integer", "description": "Maximum bytes to read. Defaults to 262144 and is capped at 1048576.", "minimum": 1, "maximum": 1048576,
+				},
+			}, "path"),
+			ReadOnly: true,
+		},
+		{
+			Name:        "file_write",
+			Description: "Write or append data to a file. Data may be UTF-8 text or base64-encoded binary, with a decoded limit of 4 MiB per call.",
+			InputSchema: objectSchema(map[string]any{
+				"path": pathProperty("File path to create or modify."),
+				"data": map[string]any{
+					"type": "string", "description": "Text data or base64 data according to encoding.",
+				},
+				"encoding": map[string]any{
+					"type": "string", "description": "Input encoding. Defaults to utf8.", "enum": []string{"utf8", "base64"},
+				},
+				"append": map[string]any{
+					"type": "boolean", "description": "Append instead of replacing the file. Defaults to false.",
+				},
+			}, "path", "data"),
+		},
+		{
+			Name:        "file_mkdir",
+			Description: "Create a directory. Recursive parent creation is enabled by default.",
+			InputSchema: objectSchema(map[string]any{
+				"path": pathProperty("Directory path to create."),
+				"recursive": map[string]any{
+					"type": "boolean", "description": "Create missing parent directories. Defaults to true.",
+				},
+			}, "path"),
 		},
 	}
 }
