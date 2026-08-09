@@ -60,14 +60,17 @@ func (s *Server) handle(conn net.Conn) {
 		_ = writeFrame(conn, helloAck{Type: "hello_ack", Accepted: false, Message: "authentication failed"})
 		return
 	}
+
 	hello.Device.Name = strings.TrimSpace(hello.Device.Name)
 	if hello.Device.Name == "" {
-		hello.Device.Name = "shellcore"
+		_ = writeFrame(conn, helloAck{Type: "hello_ack", Accepted: false, Message: "device name is required"})
+		return
 	}
+	hello.Device.Workspace = strings.TrimSpace(hello.Device.Workspace)
 
 	session, ok := s.manager.Attach(conn, hello.Device)
 	if !ok {
-		_ = writeFrame(conn, helloAck{Type: "hello_ack", Accepted: false, Message: "another device is already connected"})
+		_ = writeFrame(conn, helloAck{Type: "hello_ack", Accepted: false, Message: "device name is already connected"})
 		return
 	}
 	if err := writeFrame(conn, helloAck{Type: "hello_ack", Accepted: true, Message: "ok"}); err != nil {
@@ -78,11 +81,12 @@ func (s *Server) handle(conn net.Conn) {
 	accepted = true
 
 	slog.Info("ShellCore connected",
-		"name", hello.Device.Name,
+		"device", hello.Device.Name,
+		"workspace", hello.Device.Workspace,
 		"os", hello.Device.OS,
 		"arch", hello.Device.Arch,
 		"remote", conn.RemoteAddr(),
 	)
 	s.manager.Monitor(session)
-	slog.Info("ShellCore disconnected", "name", hello.Device.Name)
+	slog.Info("ShellCore disconnected", "device", hello.Device.Name)
 }

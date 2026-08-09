@@ -3,10 +3,10 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
-	"errors"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"zshell-gateway/internal/device"
@@ -19,76 +19,191 @@ type toolSpec struct {
 	ReadOnly    bool
 }
 
-func RegisterTools(server *mcp.Server, client *device.Manager) {
+func RegisterTools(server *mcp.Server, devices *device.Manager) {
+	registerDeviceList(server, devices)
 	for _, spec := range toolSpecs() {
-		spec := spec
-		readOnly := spec.ReadOnly
-		destructive := !readOnly
-		openWorld := !readOnly
-
-		server.AddTool(&mcp.Tool{
-			Name:        spec.Name,
-			Description: spec.Description,
-			InputSchema: spec.InputSchema,
-			OutputSchema: map[string]any{
-				"type":                 "object",
-				"additionalProperties": true,
-			},
-			Meta: mcp.Meta{
-				"securitySchemes": []any{
-					map[string]any{
-						"type":   "oauth2",
-						"scopes": []string{executeScope},
-					},
-				},
-			},
-			Annotations: &mcp.ToolAnnotations{
-				ReadOnlyHint:    readOnly,
-				DestructiveHint: boolPtr(destructive),
-				IdempotentHint:  readOnly,
-				OpenWorldHint:   boolPtr(openWorld),
-			},
-		}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			arguments := req.Params.Arguments
-			if len(arguments) == 0 {
-				arguments = json.RawMessage(`{}`)
-			}
-
-			result, failure, err := client.Call(ctx, spec.Name, arguments)
-			if err != nil {
-				if errors.Is(err, device.ErrNoDevice) {
-					return noDeviceResult(), nil
-				}
-				return nil, err
-			}
-			if failure != nil {
-				return toolFailure(spec.Name, failure), nil
-			}
-
-			var structured map[string]any
-			if err := json.Unmarshal(result.Structured, &structured); err != nil {
-				return nil, fmt.Errorf("decode ShellCore result for %q: %w", spec.Name, err)
-			}
-			mcpResult := &mcp.CallToolResult{
-				StructuredContent: structured,
-				IsError:           result.IsError,
-			}
-			mcpResult.Content = append(mcpResult.Content, &mcp.TextContent{Text: formatToolText(spec.Name, structured)})
-			return mcpResult, nil
-		})
+		registerDeviceTool(server, devices, spec)
 	}
 }
 
-func noDeviceResult() *mcp.CallToolResult {
+func registerDeviceTool(server *mcp.Server, devices *device.Manager, spec toolSpec) {
+	readOnly := spec.ReadOnly
+	destructive := !readOnly
+	openWorld := !readOnly
+
+	server.AddTool(&mcp.Tool{
+		Name:        spec.Name,
+		Description: spec.Description + " When multiple ShellCore devices are connected, pass the device name returned by device_list.",
+		InputSchema: withDeviceSchema(spec.InputSchema),
+		OutputSchema: map[string]any{
+			"type":                 "object",
+			"additionalProperties": true,
+		},
+		Meta: mcp.Meta{
+			"securitySchemes": []any{
+				map[string]any{
+					"type":   "oauth2",
+					"scopes": []string{executeScope},
+				},
+			},
+		},
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:    readOnly,
+			DestructiveHint: boolPtr(destructive),
+			IdempotentHint:  readOnly,
+			OpenWorldHint:   boolPtr(openWorld),
+		},
+	}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		deviceName, arguments, err := splitDeviceArguments(req.Params.Arguments)
+		if err != nil {
+			return nil, err
+		}
+
+		result, failure, err := devices.Call(ctx, deviceName, spec.Name, arguments)
+		if err != nil {
+			switch {
+			case errors.Is(err, device.ErrNoDevice):
+				return routingErrorResult("NoDeviceConnected", "No ShellCore device is connected.", devices.List()), nil
+			case errors.Is(err, device.ErrDeviceRequired):
+				return routingErrorResult("DeviceRequired", "Multiple ShellCore devices are connected. Call device_list and pass device explicitly.", devices.List()), nil
+			case errors.Is(err, device.ErrDeviceNotFound):
+				return routingErrorResult("DeviceNotFound", "The requested ShellCore device is not connected. Call device_list for current devices.", devices.List()), nil
+			default:
+				return nil, err
+			}
+		}
+		if failure != nil {
+			return toolFailure(spec.Name, failure), nil
+		}
+
+		var structured map[string]any
+		if err := json.Unmarshal(result.Structured, &structured); err != nil {
+			return nil, fmt.Errorf("decode ShellCore result for %q: %w", spec.Name, err)
+		}
+		mcpResult := &mcp.CallToolResult{
+			StructuredContent: structured,
+			IsError:           result.IsError,
+		}
+		mcpResult.Content = append(mcpResult.Content, &mcp.TextContent{Text: formatToolText(spec.Name, structured)})
+		return mcpResult, nil
+	})
+}
+
+func registerDeviceList(server *mcp.Server, devices *device.Manager) {
+	server.AddTool(&mcp.Tool{
+		Name:        "device_list",
+		Description: "List all currently connected ShellCore devices and their workspaces. Use the returned name as the device selector for other tools.",
+		InputSchema: objectSchema(map[string]any{}),
+		OutputSchema: map[string]any{
+			"type":                 "object",
+			"additionalProperties": true,
+		},
+		Meta: mcp.Meta{
+			"securitySchemes": []any{
+				map[string]any{
+					"type":   "oauth2",
+					"scopes": []string{executeScope},
+				},
+			},
+		},
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:    true,
+			DestructiveHint: boolPtr(false),
+			IdempotentHint:  true,
+			OpenWorldHint:   boolPtr(false),
+		},
+	}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		_ = ctx
+		_ = req
+		connected := devices.List()
+		structured := map[string]any{
+			"count":   len(connected),
+			"devices": connected,
+		}
+		result := &mcp.CallToolResult{StructuredContent: structured}
+		result.Content = append(result.Content, &mcp.TextContent{Text: formatDeviceListText(connected)})
+		return result, nil
+	})
+}
+
+func withDeviceSchema(schema map[string]any) map[string]any {
+	copySchema := make(map[string]any, len(schema))
+	for key, value := range schema {
+		copySchema[key] = value
+	}
+
+	properties := map[string]any{}
+	if existing, ok := schema["properties"].(map[string]any); ok {
+		for key, value := range existing {
+			properties[key] = value
+		}
+	}
+	deviceProperty := map[string]any{
+		"type":        "string",
+		"description": "ShellCore device name returned by device_list. Optional only when exactly one device is connected.",
+		"minLength":   1,
+	}
+	properties["device"] = deviceProperty
+	copySchema["properties"] = properties
+	return copySchema
+}
+func splitDeviceArguments(arguments json.RawMessage) (string, json.RawMessage, error) {
+	if len(arguments) == 0 {
+		return "", json.RawMessage(`{}`), nil
+	}
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(arguments, &fields); err != nil {
+		return "", nil, fmt.Errorf("decode tool arguments: %w", err)
+	}
+
+	var deviceName string
+	if raw, ok := fields["device"]; ok {
+		if err := json.Unmarshal(raw, &deviceName); err != nil {
+			return "", nil, fmt.Errorf("device must be a string")
+		}
+		delete(fields, "device")
+	}
+
+	forwarded, err := json.Marshal(fields)
+	if err != nil {
+		return "", nil, fmt.Errorf("encode ShellCore arguments: %w", err)
+	}
+	return strings.TrimSpace(deviceName), forwarded, nil
+}
+
+func routingErrorResult(code, message string, devices []device.ConnectedDevice) *mcp.CallToolResult {
 	result := &mcp.CallToolResult{
 		StructuredContent: map[string]any{
-			"error":   "NoDeviceConnected",
-			"message": "无设备连接",
+			"error":   code,
+			"message": message,
+			"count":   len(devices),
+			"devices": devices,
 		},
 		IsError: true,
 	}
-	result.Content = append(result.Content, &mcp.TextContent{Text: "无设备连接"})
+	result.Content = append(result.Content, &mcp.TextContent{Text: message})
 	return result
+}
+
+func formatDeviceListText(devices []device.ConnectedDevice) string {
+	if len(devices) == 0 {
+		return "No ShellCore devices are connected."
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d ShellCore device(s) connected:\n", len(devices))
+	for _, item := range devices {
+		fmt.Fprintf(&b, "- %s | %s/%s", item.Name, item.OS, item.Arch)
+		if item.Workspace != "" {
+			fmt.Fprintf(&b, " | workspace: %s", item.Workspace)
+		}
+		if item.Version != "" {
+			fmt.Fprintf(&b, " | core: %s", item.Version)
+		}
+		b.WriteByte('\n')
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 func toolFailure(name string, failure *device.Failure) *mcp.CallToolResult {
@@ -108,7 +223,6 @@ func toolFailure(name string, failure *device.Failure) *mcp.CallToolResult {
 	result.Content = append(result.Content, &mcp.TextContent{Text: text})
 	return result
 }
-
 func formatToolText(name string, value map[string]any) string {
 	switch name {
 	case "environment_info":

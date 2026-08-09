@@ -15,10 +15,11 @@ const (
 )
 
 type Info struct {
-	Name    string `json:"name"`
-	OS      string `json:"os"`
-	Arch    string `json:"arch"`
-	Version string `json:"version"`
+	Name      string `json:"name"`
+	Workspace string `json:"workspace,omitempty"`
+	OS        string `json:"os"`
+	Arch      string `json:"arch"`
+	Version   string `json:"version"`
 }
 
 type helloMessage struct {

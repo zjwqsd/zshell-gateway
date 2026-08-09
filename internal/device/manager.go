@@ -6,17 +6,23 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-var ErrNoDevice = errors.New("no device connected")
+var (
+	ErrNoDevice       = errors.New("no device connected")
+	ErrDeviceRequired = errors.New("multiple devices connected; device is required")
+	ErrDeviceNotFound = errors.New("device not found")
+)
 
 type Manager struct {
-	mu      sync.RWMutex
-	current *Session
-	nextID  atomic.Uint64
+	mu         sync.RWMutex
+	sessions   map[string]*Session
+	nextCallID atomic.Uint64
 }
 
 type Session struct {
@@ -27,63 +33,100 @@ type Session struct {
 	closed  sync.Once
 }
 
+type ConnectedDevice struct {
+	Name      string `json:"name"`
+	Workspace string `json:"workspace,omitempty"`
+	OS        string `json:"os"`
+	Arch      string `json:"arch"`
+	Version   string `json:"version"`
+}
+
 func NewManager() *Manager {
-	return &Manager{}
+	return &Manager{sessions: make(map[string]*Session)}
 }
 
 func (m *Manager) Attach(conn net.Conn, info Info) (*Session, bool) {
+	name := strings.TrimSpace(info.Name)
+	if name == "" {
+		return nil, false
+	}
+	info.Name = name
+
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.current != nil {
+	if _, exists := m.sessions[name]; exists {
+		m.mu.Unlock()
 		return nil, false
 	}
 	session := &Session{manager: m, conn: conn, info: info}
-	m.current = session
+	m.sessions[name] = session
+	m.mu.Unlock()
+
 	return session, true
 }
 
-func (m *Manager) Connected() bool {
+func (m *Manager) List() []ConnectedDevice {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.current != nil
-}
-
-func (m *Manager) CurrentInfo() (Info, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.current == nil {
-		return Info{}, false
+	devices := make([]ConnectedDevice, 0, len(m.sessions))
+	for _, session := range m.sessions {
+		devices = append(devices, session.device())
 	}
-	return m.current.info, true
+	m.mu.RUnlock()
+
+	sort.Slice(devices, func(i, j int) bool {
+		return devices[i].Name < devices[j].Name
+	})
+	return devices
 }
 
-func (m *Manager) currentSession() (*Session, error) {
+func (m *Manager) resolve(name string) (*Session, error) {
+	name = strings.TrimSpace(name)
+
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.current == nil {
+
+	if name != "" {
+		session := m.sessions[name]
+		if session == nil {
+			return nil, ErrDeviceNotFound
+		}
+		return session, nil
+	}
+
+	switch len(m.sessions) {
+	case 0:
 		return nil, ErrNoDevice
+	case 1:
+		for _, session := range m.sessions {
+			return session, nil
+		}
+		panic("unreachable")
+	default:
+		return nil, ErrDeviceRequired
 	}
-	return m.current, nil
 }
 
-func (m *Manager) Call(ctx context.Context, operation string, arguments json.RawMessage) (Result, *Failure, error) {
-	session, err := m.currentSession()
+func (m *Manager) Call(ctx context.Context, name, operation string, arguments json.RawMessage) (Result, *Failure, error) {
+	session, err := m.resolve(name)
 	if err != nil {
 		return Result{}, nil, err
 	}
-	result, failure, err := session.call(ctx, m.nextID.Add(1), operation, arguments)
+
+	result, failure, err := session.call(ctx, m.nextCallID.Add(1), operation, arguments)
 	if err != nil {
 		m.Detach(session)
+		if strings.TrimSpace(name) != "" {
+			return Result{}, nil, ErrDeviceNotFound
+		}
 		return Result{}, nil, ErrNoDevice
 	}
 	return result, failure, nil
 }
 
 func (m *Manager) Ping(session *Session, timeout time.Duration) error {
-	if !m.isCurrent(session) {
+	if !m.isAttached(session) {
 		return ErrNoDevice
 	}
-	if err := session.ping(m.nextID.Add(1), timeout); err != nil {
+	if err := session.ping(m.nextCallID.Add(1), timeout); err != nil {
 		m.Detach(session)
 		return err
 	}
@@ -91,10 +134,10 @@ func (m *Manager) Ping(session *Session, timeout time.Duration) error {
 }
 
 func (m *Manager) Monitor(session *Session) {
-	ticker := time.NewTicker(15 * time.Second)
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		if err := m.Ping(session, 5*time.Second); err != nil {
+		if err := m.Ping(session, 3*time.Second); err != nil {
 			return
 		}
 	}
@@ -102,8 +145,8 @@ func (m *Manager) Monitor(session *Session) {
 
 func (m *Manager) Detach(session *Session) {
 	m.mu.Lock()
-	if m.current == session {
-		m.current = nil
+	if current := m.sessions[session.info.Name]; current == session {
+		delete(m.sessions, session.info.Name)
 	}
 	m.mu.Unlock()
 	session.close()
@@ -111,18 +154,32 @@ func (m *Manager) Detach(session *Session) {
 
 func (m *Manager) Close() {
 	m.mu.Lock()
-	session := m.current
-	m.current = nil
+	sessions := make([]*Session, 0, len(m.sessions))
+	for name, session := range m.sessions {
+		delete(m.sessions, name)
+		sessions = append(sessions, session)
+	}
 	m.mu.Unlock()
-	if session != nil {
+
+	for _, session := range sessions {
 		session.close()
 	}
 }
 
-func (m *Manager) isCurrent(session *Session) bool {
+func (m *Manager) isAttached(session *Session) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.current == session
+	return m.sessions[session.info.Name] == session
+}
+
+func (s *Session) device() ConnectedDevice {
+	return ConnectedDevice{
+		Name:      s.info.Name,
+		Workspace: s.info.Workspace,
+		OS:        s.info.OS,
+		Arch:      s.info.Arch,
+		Version:   s.info.Version,
+	}
 }
 
 func (s *Session) close() {
@@ -146,12 +203,7 @@ func (s *Session) call(ctx context.Context, id uint64, operation string, argumen
 	}
 	defer clearDeadline(s.conn)
 
-	if err := writeFrame(s.conn, callMessage{
-		Type:      "call",
-		ID:        id,
-		Operation: operation,
-		Arguments: arguments,
-	}); err != nil {
+	if err := writeFrame(s.conn, callMessage{Type: "call", ID: id, Operation: operation, Arguments: arguments}); err != nil {
 		return Result{}, nil, err
 	}
 

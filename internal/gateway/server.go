@@ -35,7 +35,7 @@ func NewServer(cfg Config) (*Server, error) {
 		Name:    "zshell",
 		Version: "0.2.0",
 	}, &mcp.ServerOptions{
-		Instructions: "Provides terminal access through the single connected ShellCore device. If no device is connected, every tool call returns 无设备连接. Local human control on ShellCore may block new mutating actions or terminate active work.",
+		Instructions: "Provides terminal access through connected ShellCore devices. Device names are declared by each ShellCore and update dynamically as devices connect or disconnect. Call device_list to inspect current devices and workspaces. When multiple devices are online, select one explicitly with the device argument. Local human control on each ShellCore may block new mutating actions or terminate active work.",
 	})
 	RegisterTools(mcpServer, devices)
 

@@ -5,26 +5,40 @@ ChatGPT / MCP client
         |
         | HTTPS + OAuth
         v
-+---------------------------+
-| zshell-gateway (Go)       |
-|                           |
-| MCP :8765                 |
-| OAuth                     |
-| Tool registry             |
-| Single-device manager     |
-+-------------+-------------+
-              |
-              | private TCP :8767
-              | length-prefixed JSON
-              v
-        zshell-core (Zig)
++----------------------------------+
+| zshell-gateway (Go)              |
+|                                  |
+| MCP :8765                        |
+| OAuth                            |
+| Tool registry                    |
+| Live device registry             |
+| name -> ShellCore session        |
++----------------+-----------------+
+                 |
+                 | private TCP :8767
+                 | length-prefixed JSON
+       +---------+----------+---------+
+       |                    |         |
+       v                    v         v
+  Core "laptop"       Core "4090"  Core "project-b"
+  workspace A         workspace B   workspace C
 ```
 
 ## Connection ownership
 
 ShellCore always initiates the device connection. The gateway never scans for or dials ShellCore.
 
-The device manager has zero or one active session. Tool requests are serialized over that session. Heartbeats are also serialized so a legitimate long-running tool invocation cannot be mistaken for a dead connection.
+The registry contains zero or more active sessions keyed by the name declared by ShellCore. Names are unique while online; a duplicate handshake is rejected.
+
+Calls to different devices may proceed independently. Calls and heartbeat traffic on one device session remain serialized by that session's connection lock.
+
+## MCP routing
+
+`device_list` is always available and reads the live registry.
+
+All ShellCore-backed tools accept a `device` selector. With one online device the selector may be omitted. With multiple devices omission returns `DeviceRequired` rather than guessing a destination.
+
+The MCP tool schema is stable: `device` is a plain string. Device membership is kept only in the live registry and resolved at call time, so connect/disconnect/rename does not require a tool-schema refresh.
 
 ## Device protocol v1
 
@@ -40,7 +54,7 @@ Maximum payload size: 16 MiB.
 Handshake:
 
 ```text
-ShellCore -> hello(protocol=1, token, device info)
+ShellCore -> hello(protocol=1, token, device{name, workspace, os, arch, version})
 Gateway   -> hello_ack(accepted=true/false)
 ```
 
@@ -58,4 +72,4 @@ Gateway   -> ping(id)
 ShellCore -> pong(id)
 ```
 
-A transport failure removes the current session immediately. Subsequent MCP tool calls return `无设备连接` until a ShellCore reconnects.
+The gateway currently probes each connection every three seconds. A failed transport is removed from the live registry immediately.
