@@ -2,15 +2,20 @@ package device
 
 import (
 	"errors"
-	"net"
 	"testing"
+	"time"
 )
+
+type fakeTransport struct{}
+
+func (*fakeTransport) Send(any) error              { return nil }
+func (*fakeTransport) Receive(any) error           { return nil }
+func (*fakeTransport) SetDeadline(time.Time) error { return nil }
+func (*fakeTransport) Close() error                { return nil }
 
 func TestManagerMultipleDevicesAndDuplicateName(t *testing.T) {
 	manager := NewManager()
-	alphaServer, alphaClient := net.Pipe()
-	defer alphaClient.Close()
-	alpha, ok := manager.Attach(alphaServer, Info{
+	alpha, ok := manager.Attach(&fakeTransport{}, Info{
 		Name:      "alpha",
 		Workspace: "C:/work/alpha",
 		OS:        "windows",
@@ -21,16 +26,11 @@ func TestManagerMultipleDevicesAndDuplicateName(t *testing.T) {
 		t.Fatal("first alpha connection was rejected")
 	}
 
-	duplicateServer, duplicateClient := net.Pipe()
-	defer duplicateServer.Close()
-	defer duplicateClient.Close()
-	if _, ok := manager.Attach(duplicateServer, Info{Name: "alpha"}); ok {
+	if _, ok := manager.Attach(&fakeTransport{}, Info{Name: "alpha"}); ok {
 		t.Fatal("duplicate alpha connection was accepted")
 	}
 
-	betaServer, betaClient := net.Pipe()
-	defer betaClient.Close()
-	beta, ok := manager.Attach(betaServer, Info{
+	beta, ok := manager.Attach(&fakeTransport{}, Info{
 		Name:      "beta",
 		Workspace: "/srv/beta",
 		OS:        "linux",
@@ -50,6 +50,9 @@ func TestManagerMultipleDevicesAndDuplicateName(t *testing.T) {
 	}
 	if devices[0].Workspace != "C:/work/alpha" || devices[1].Workspace != "/srv/beta" {
 		t.Fatalf("workspace metadata was not preserved: %+v", devices)
+	}
+	if devices[0].Transport != "websocket" || devices[1].Transport != "websocket" {
+		t.Fatalf("transport metadata is wrong: %+v", devices)
 	}
 
 	if _, err := manager.resolve(""); !errors.Is(err, ErrDeviceRequired) {

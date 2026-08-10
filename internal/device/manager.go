@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"sort"
 	"strings"
 	"sync"
@@ -19,6 +18,13 @@ var (
 	ErrDeviceNotFound = errors.New("device not found")
 )
 
+type messageTransport interface {
+	Send(any) error
+	Receive(any) error
+	SetDeadline(time.Time) error
+	Close() error
+}
+
 type Manager struct {
 	mu         sync.RWMutex
 	sessions   map[string]*Session
@@ -26,11 +32,11 @@ type Manager struct {
 }
 
 type Session struct {
-	manager *Manager
-	conn    net.Conn
-	info    Info
-	callMu  sync.Mutex
-	closed  sync.Once
+	manager   *Manager
+	transport messageTransport
+	info      Info
+	callMu    sync.Mutex
+	closed    sync.Once
 }
 
 type ConnectedDevice struct {
@@ -39,28 +45,41 @@ type ConnectedDevice struct {
 	OS        string `json:"os"`
 	Arch      string `json:"arch"`
 	Version   string `json:"version"`
+	Transport string `json:"transport"`
 }
 
 func NewManager() *Manager {
 	return &Manager{sessions: make(map[string]*Session)}
 }
 
-func (m *Manager) Attach(conn net.Conn, info Info) (*Session, bool) {
-	name := strings.TrimSpace(info.Name)
-	if name == "" {
+func normalizeInfo(info Info) (Info, bool) {
+	info.Name = strings.TrimSpace(info.Name)
+	info.Workspace = strings.TrimSpace(info.Workspace)
+	info.OS = strings.TrimSpace(info.OS)
+	info.Arch = strings.TrimSpace(info.Arch)
+	info.Version = strings.TrimSpace(info.Version)
+	if info.Name == "" || len(info.Name) > 128 {
+		return Info{}, false
+	}
+	if len(info.Workspace) > 4096 || len(info.OS) > 128 || len(info.Arch) > 128 || len(info.Version) > 128 {
+		return Info{}, false
+	}
+	return info, true
+}
+
+func (m *Manager) Attach(transport messageTransport, info Info) (*Session, bool) {
+	info, ok := normalizeInfo(info)
+	if !ok || transport == nil {
 		return nil, false
 	}
-	info.Name = name
 
 	m.mu.Lock()
-	if _, exists := m.sessions[name]; exists {
-		m.mu.Unlock()
+	defer m.mu.Unlock()
+	if _, exists := m.sessions[info.Name]; exists {
 		return nil, false
 	}
-	session := &Session{manager: m, conn: conn, info: info}
-	m.sessions[name] = session
-	m.mu.Unlock()
-
+	session := &Session{manager: m, transport: transport, info: info}
+	m.sessions[info.Name] = session
 	return session, true
 }
 
@@ -83,7 +102,6 @@ func (m *Manager) resolve(name string) (*Session, error) {
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-
 	if name != "" {
 		session := m.sessions[name]
 		if session == nil {
@@ -179,12 +197,13 @@ func (s *Session) device() ConnectedDevice {
 		OS:        s.info.OS,
 		Arch:      s.info.Arch,
 		Version:   s.info.Version,
+		Transport: "websocket",
 	}
 }
 
 func (s *Session) close() {
 	s.closed.Do(func() {
-		_ = s.conn.Close()
+		_ = s.transport.Close()
 	})
 }
 
@@ -198,17 +217,17 @@ func (s *Session) call(ctx context.Context, id uint64, operation string, argumen
 
 	s.callMu.Lock()
 	defer s.callMu.Unlock()
-	if err := applyDeadline(s.conn, ctx); err != nil {
+	if err := applyDeadline(s.transport, ctx); err != nil {
 		return Result{}, nil, err
 	}
-	defer clearDeadline(s.conn)
+	defer clearDeadline(s.transport)
 
-	if err := writeFrame(s.conn, callMessage{Type: "call", ID: id, Operation: operation, Arguments: arguments}); err != nil {
+	if err := s.transport.Send(callMessage{Type: "call", ID: id, Operation: operation, Arguments: arguments}); err != nil {
 		return Result{}, nil, err
 	}
 
 	var response wireResponse
-	if err := readFrame(s.conn, &response); err != nil {
+	if err := s.transport.Receive(&response); err != nil {
 		return Result{}, nil, err
 	}
 	if response.Type != "result" || response.ID != id || len(response.Payload) == 0 {
@@ -234,16 +253,16 @@ func (s *Session) call(ctx context.Context, id uint64, operation string, argumen
 func (s *Session) ping(id uint64, timeout time.Duration) error {
 	s.callMu.Lock()
 	defer s.callMu.Unlock()
-	if err := s.conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+	if err := s.transport.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return err
 	}
-	defer clearDeadline(s.conn)
+	defer clearDeadline(s.transport)
 
-	if err := writeFrame(s.conn, pingMessage{Type: "ping", ID: id}); err != nil {
+	if err := s.transport.Send(pingMessage{Type: "ping", ID: id}); err != nil {
 		return err
 	}
 	var response wireResponse
-	if err := readFrame(s.conn, &response); err != nil {
+	if err := s.transport.Receive(&response); err != nil {
 		return err
 	}
 	if response.Type != "pong" || response.ID != id {
@@ -252,13 +271,13 @@ func (s *Session) ping(id uint64, timeout time.Duration) error {
 	return nil
 }
 
-func applyDeadline(conn net.Conn, ctx context.Context) error {
+func applyDeadline(transport messageTransport, ctx context.Context) error {
 	if deadline, ok := ctx.Deadline(); ok {
-		return conn.SetDeadline(deadline)
+		return transport.SetDeadline(deadline)
 	}
-	return conn.SetDeadline(time.Time{})
+	return transport.SetDeadline(time.Time{})
 }
 
-func clearDeadline(conn net.Conn) {
-	_ = conn.SetDeadline(time.Time{})
+func clearDeadline(transport messageTransport) {
+	_ = transport.SetDeadline(time.Time{})
 }

@@ -1,75 +1,59 @@
 # Gateway architecture
 
 ```text
-ChatGPT / MCP client
-        |
-        | HTTPS + OAuth
-        v
-+----------------------------------+
-| zshell-gateway (Go)              |
-|                                  |
-| MCP :8765                        |
-| OAuth                            |
-| Tool registry                    |
-| Live device registry             |
-| name -> ShellCore session        |
-+----------------+-----------------+
-                 |
-                 | private TCP :8767
-                 | length-prefixed JSON
-       +---------+----------+---------+
-       |                    |         |
-       v                    v         v
-  Core "laptop"       Core "4090"  Core "project-b"
-  workspace A         workspace B   workspace C
+                         zshell-gateway :8765
+                                |
+        +-----------------------+-----------------------+
+        |                       |                       |
+      /mcp                  /oauth/*               /device/ws
+        |                                               |
+   ChatGPT / MCP                               WebSocket devices
+                                                /             \
+                                 wss:// public /               \ ws:// LAN
+                                              /                 \
+                                         Core "laptop"     Core "server"
 ```
 
-## Connection ownership
+## One-port design
 
-ShellCore always initiates the device connection. The gateway never scans for or dials ShellCore.
+The gateway runs one `net/http` server. HTTP paths select the protocol handler, so MCP, OAuth and ShellCore WebSockets do not need separate ports.
 
-The registry contains zero or more active sessions keyed by the name declared by ShellCore. Names are unique while online; a duplicate handshake is rejected.
+The old dedicated device TCP transport has been removed. There is no length-prefixed raw-TCP listener.
 
-Calls to different devices may proceed independently. Calls and heartbeat traffic on one device session remain serialized by that session's connection lock.
+## Device connection
+
+1. ShellCore opens `ws://.../device/ws` or `wss://.../device/ws`.
+2. The HTTP Upgrade request carries `Authorization: Bearer <device token>`.
+3. After the WebSocket upgrade, Core sends `hello(protocol=2, device={...})`.
+4. The gateway validates metadata and rejects duplicate live device names.
+5. The persistent WebSocket carries application JSON messages in both directions.
+
+Application messages:
+
+```text
+Gateway -> call(id, operation, arguments)
+Core    -> result(id, payload)
+
+Gateway -> ping(id)
+Core    -> pong(id)
+```
+
+WebSocket protocol control frames are handled independently by the WebSocket implementation.
 
 ## MCP routing
 
-`device_list` is always available and reads the live registry.
+`device_list` reads the live registry. Every Core-backed tool accepts an optional `device` selector:
 
-All ShellCore-backed tools accept a `device` selector. With one online device the selector may be omitted. With multiple devices omission returns `DeviceRequired` rather than guessing a destination.
+- zero devices: `NoDevice`
+- one device: omission resolves to that device
+- multiple devices: omission returns `DeviceRequired`
 
-The MCP tool schema is stable: `device` is a plain string. Device membership is kept only in the live registry and resolved at call time, so connect/disconnect/rename does not require a tool-schema refresh.
+The MCP tool schema keeps `device` as a plain string so device connect/disconnect/rename does not require schema refresh.
 
-## Device protocol v1
+## Security boundary
 
-Each frame is:
+Public deployments should terminate TLS at the public endpoint and use `wss://` from Core. A typical Cloudflare Tunnel or reverse-proxy deployment forwards the public hostname to `127.0.0.1:8765`.
 
-```text
-4-byte big-endian payload length
-JSON payload
-```
+The shared device secret is sent only in the authenticated WebSocket upgrade. On `wss://`, TLS protects it in transit. Plain `ws://` is reserved for trusted LAN use.
 
-Maximum payload size: 16 MiB.
-
-Handshake:
-
-```text
-ShellCore -> hello(protocol=1, token, device{name, workspace, os, arch, version})
-Gateway   -> hello_ack(accepted=true/false)
-```
-
-Calls:
-
-```text
-Gateway   -> call(id, operation, arguments)
-ShellCore -> result(id, payload)
-```
-
-Liveness:
-
-```text
-Gateway   -> ping(id)
-ShellCore -> pong(id)
-```
-
-The gateway currently probes each connection every three seconds. A failed transport is removed from the live registry immediately.
+Incoming WebSocket payloads are limited to 8 MiB and the HTTP server applies bounded header and read-header handling.

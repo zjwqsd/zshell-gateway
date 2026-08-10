@@ -1,95 +1,95 @@
 # zshell-gateway
 
-Go-based public protocol layer for zshell.
+Go protocol gateway for zshell.
 
-The gateway owns MCP, OAuth and the ShellCore device registry. It contains no local shell execution implementation.
+The gateway exposes one HTTP service. MCP, OAuth, health checks and ShellCore device connections all share the same listen address and are separated by HTTP paths.
 
-## Responsibilities
+## Endpoints
 
-- MCP Streamable HTTP endpoint on `ZSHELL_MCP_LISTEN` (default `127.0.0.1:8765`)
-- OAuth Authorization Code + PKCE + dynamic client registration
-- private ShellCore TCP listener on `ZSHELL_DEVICE_LISTEN` (default `0.0.0.0:8767`)
-- authentication of ShellCore with `ZSHELL_DEVICE_TOKEN`
-- concurrent registration of multiple ShellCore devices
-- routing MCP calls by the device-provided name
-- heartbeat detection and immediate disconnect cleanup
+```text
+/mcp          MCP Streamable HTTP
+/oauth/*      OAuth authorization endpoints
+/.well-known/* OAuth/MCP metadata
+/device/ws    ShellCore WebSocket transport
+/healthz      process health
+```
 
-## Device identity
+Default listen address:
 
-Each ShellCore must provide a unique `ZSHELL_DEVICE_NAME` during its handshake.
+```text
+127.0.0.1:8765
+```
 
-The gateway never generates or changes device names. If a name is already online, another ShellCore using the same name is rejected.
+There is no separate ShellCore TCP listener.
 
-`device_list` returns the current live registry, including each device's:
+## ShellCore transport
 
-- `name`
-- `workspace`
-- `os`
-- `arch`
-- `version`
+ShellCore connects outbound to `/device/ws` and authenticates the WebSocket upgrade with:
 
-Every normal MCP tool has an optional `device` selector. When exactly one device is online it may be omitted. When multiple devices are online it is required.
+```text
+Authorization: Bearer <ZSHELL_DEVICE_TOKEN>
+```
 
-The `device` field is always a plain string in the MCP schema. Online names are intentionally not encoded as a schema `enum`: clients may cache tool schemas while devices connect, disconnect, or rename. The gateway validates the requested name against its live registry at call time.
+After the upgrade, the same WebSocket carries the device hello, calls, results and liveness messages. Device names are supplied by ShellCore and must be unique while connected.
+
+Recommended URLs:
+
+```text
+Public: wss://zshell.example.com/device/ws
+LAN:    ws://192.168.1.20:8765/device/ws
+```
+
+Use `wss://` for any untrusted network. `ws://` is intended only for trusted LAN use because its traffic and device token are not encrypted.
 
 ## Required environment
 
 ```text
-ZSHELL_PUBLIC_BASE_URL=https://mcp.example.com
+ZSHELL_PUBLIC_BASE_URL=https://zshell.example.com
 ZSHELL_OAUTH_ADMIN_PIN=<24-512 character secret>
 ZSHELL_OAUTH_JWT_SECRET=<exactly 64 hexadecimal characters>
-ZSHELL_DEVICE_TOKEN=<24-512 character shared device secret>
+ZSHELL_DEVICE_TOKEN=<24-512 character device secret>
 ```
 
 Optional:
 
 ```text
 ZSHELL_MCP_LISTEN=127.0.0.1:8765
-ZSHELL_DEVICE_LISTEN=0.0.0.0:8767
 ```
 
-The same `ZSHELL_DEVICE_TOKEN` must be configured on every ShellCore allowed to join this gateway.
+For a direct LAN deployment, bind the single HTTP service to a LAN interface, for example:
 
-## Build
+```text
+ZSHELL_MCP_LISTEN=0.0.0.0:8765
+```
+
+## Public deployment
+
+A reverse proxy or Cloudflare Tunnel only needs to expose the single HTTP service:
+
+```text
+zshell.example.com -> http://127.0.0.1:8765
+```
+
+Then both clients use the same hostname:
+
+```text
+ChatGPT -> https://zshell.example.com/mcp
+Core    -> wss://zshell.example.com/device/ws
+```
+
+No additional public device port is required.
+
+## Build and test
 
 ```bash
+go test ./...
 go build ./cmd/zshell-gateway
 ```
 
-## Run
+## Security notes
 
-Linux / Android Debian:
-
-```bash
-export ZSHELL_PUBLIC_BASE_URL=https://mcp.example.com
-export ZSHELL_OAUTH_ADMIN_PIN='replace-with-a-long-secret'
-export ZSHELL_OAUTH_JWT_SECRET='replace-with-64-hex-characters'
-export ZSHELL_DEVICE_TOKEN='replace-with-a-long-device-secret'
-./zshell-gateway
-```
-
-PowerShell:
-
-```powershell
-$env:ZSHELL_PUBLIC_BASE_URL = "https://mcp.example.com"
-$env:ZSHELL_OAUTH_ADMIN_PIN = "replace-with-a-long-secret"
-$env:ZSHELL_OAUTH_JWT_SECRET = "replace-with-64-hex-characters"
-$env:ZSHELL_DEVICE_TOKEN = "replace-with-a-long-device-secret"
-.\zshell-gateway.exe
-```
-
-ShellCore instances may start before or after the gateway and reconnect automatically.
-
-## Network
-
-Expose only the MCP HTTP service publicly:
-
-```text
-mcp.example.com -> http://127.0.0.1:8765
-```
-
-Port `8767` is the ShellCore transport. The current device protocol uses a shared token over raw TCP, so this port should be reachable only through a trusted network, VPN, private tunnel or equivalent protected path.
-
-## Health behavior
-
-`GET /healthz` reports gateway process health, not device availability. It remains `ok` with zero connected devices.
+- Keep `ZSHELL_DEVICE_TOKEN` high-entropy and out of logs/source control.
+- Public ShellCore connections must use `wss://` so TLS protects the token and device traffic.
+- WebSocket messages are capped at 8 MiB.
+- The HTTP server applies header/read timeouts; the device registry rejects duplicate live names.
+- Stopping a Core closes its WebSocket and removes the device from the live registry.

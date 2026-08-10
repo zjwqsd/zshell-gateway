@@ -1,0 +1,108 @@
+package device
+
+import (
+	"crypto/subtle"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+
+	"golang.org/x/net/websocket"
+)
+
+const (
+	webSocketHandshakeTimeout = 10 * time.Second
+	maxWebSocketPayloadBytes  = 8 << 20
+)
+
+type webSocketTransport struct {
+	conn *websocket.Conn
+}
+
+func (t *webSocketTransport) Send(value any) error {
+	return websocket.JSON.Send(t.conn, value)
+}
+
+func (t *webSocketTransport) Receive(value any) error {
+	return websocket.JSON.Receive(t.conn, value)
+}
+
+func (t *webSocketTransport) SetDeadline(deadline time.Time) error {
+	return t.conn.SetDeadline(deadline)
+}
+
+func (t *webSocketTransport) Close() error {
+	return t.conn.Close()
+}
+
+func NewWebSocketHandler(token string, manager *Manager) http.Handler {
+	handler := &webSocketHandler{token: token, manager: manager}
+	return websocket.Server{
+		Handshake: handler.handshake,
+		Handler:   handler.handle,
+	}
+}
+
+type webSocketHandler struct {
+	token   string
+	manager *Manager
+}
+
+func (h *webSocketHandler) handshake(_ *websocket.Config, r *http.Request) error {
+	if r.Method != http.MethodGet {
+		return fmt.Errorf("websocket upgrade requires GET")
+	}
+	presented, ok := bearerToken(r.Header.Get("Authorization"))
+	if !ok || subtle.ConstantTimeCompare([]byte(presented), []byte(h.token)) != 1 {
+		return fmt.Errorf("device authentication failed")
+	}
+	return nil
+}
+
+func (h *webSocketHandler) handle(conn *websocket.Conn) {
+	conn.MaxPayloadBytes = maxWebSocketPayloadBytes
+	_ = conn.SetDeadline(time.Now().Add(webSocketHandshakeTimeout))
+
+	var hello helloMessage
+	if err := websocket.JSON.Receive(conn, &hello); err != nil {
+		slog.Warn("ShellCore WebSocket hello failed", "remote", conn.Request().RemoteAddr, "error", err)
+		return
+	}
+	if hello.Type != "hello" || hello.Protocol != ProtocolVersion {
+		_ = websocket.JSON.Send(conn, helloAck{Type: "hello_ack", Accepted: false, Message: "unsupported protocol"})
+		return
+	}
+
+	transport := &webSocketTransport{conn: conn}
+	session, ok := h.manager.Attach(transport, hello.Device)
+	if !ok {
+		_ = websocket.JSON.Send(conn, helloAck{Type: "hello_ack", Accepted: false, Message: "invalid or duplicate device name"})
+		return
+	}
+	if err := websocket.JSON.Send(conn, helloAck{Type: "hello_ack", Accepted: true, Message: "ok"}); err != nil {
+		h.manager.Detach(session)
+		return
+	}
+	_ = conn.SetDeadline(time.Time{})
+
+	slog.Info("ShellCore connected",
+		"device", session.info.Name,
+		"workspace", session.info.Workspace,
+		"os", session.info.OS,
+		"arch", session.info.Arch,
+		"transport", "websocket",
+		"remote", conn.Request().RemoteAddr,
+	)
+	h.manager.Monitor(session)
+	h.manager.Detach(session)
+	slog.Info("ShellCore disconnected", "device", session.info.Name, "transport", "websocket")
+}
+
+func bearerToken(header string) (string, bool) {
+	parts := strings.Fields(header)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || parts[1] == "" {
+		return "", false
+	}
+	return parts[1], true
+}

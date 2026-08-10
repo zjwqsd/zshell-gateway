@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"time"
@@ -15,27 +14,21 @@ import (
 )
 
 type Server struct {
-	cfg          Config
-	devices      *device.Manager
-	deviceServer *device.Server
-	oauth        *OAuthProvider
-	httpServer   *http.Server
+	cfg        Config
+	devices    *device.Manager
+	oauth      *OAuthProvider
+	httpServer *http.Server
 }
 
 func NewServer(cfg Config) (*Server, error) {
 	devices := device.NewManager()
-	deviceListener, err := net.Listen("tcp", cfg.DeviceListen)
-	if err != nil {
-		return nil, err
-	}
-	deviceServer := device.NewServer(deviceListener, cfg.DeviceToken, devices)
 	oauthProvider := NewOAuthProvider(cfg.PublicBase, cfg.AdminPIN, cfg.JWTSecret)
 
 	mcpServer := mcp.NewServer(&mcp.Implementation{
 		Name:    "zshell",
 		Version: "0.2.0",
 	}, &mcp.ServerOptions{
-		Instructions: "Provides terminal access through connected ShellCore devices. Device names are declared by each ShellCore and update dynamically as devices connect or disconnect. Call device_list to inspect current devices and workspaces. When multiple devices are online, select one explicitly with the device argument. Local human control on each ShellCore may block new mutating actions or terminate active work.",
+		Instructions: "Provides terminal access through connected ShellCore devices over WebSocket. Device names are declared by each ShellCore and update dynamically as devices connect or disconnect. Call device_list to inspect current devices and workspaces. When multiple devices are online, select one explicitly with the device argument. Local human control on each ShellCore may block new mutating actions or terminate active work.",
 	})
 	RegisterTools(mcpServer, devices)
 
@@ -60,6 +53,7 @@ func NewServer(cfg Config) (*Server, error) {
 	)(mcpHandler)
 
 	mux := http.NewServeMux()
+	mux.Handle("/device/ws", device.NewWebSocketHandler(cfg.DeviceToken, devices))
 	mux.Handle("/mcp", logRequest("mcp", authedMCP))
 	mux.HandleFunc("/.well-known/oauth-protected-resource", oauthProvider.HandleProtectedResource)
 	mux.HandleFunc("/.well-known/oauth-protected-resource/mcp", oauthProvider.HandleProtectedResource)
@@ -82,32 +76,25 @@ func NewServer(cfg Config) (*Server, error) {
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       90 * time.Second,
+		MaxHeaderBytes:    32 << 10,
 	}
 
 	return &Server{
-		cfg:          cfg,
-		devices:      devices,
-		deviceServer: deviceServer,
-		oauth:        oauthProvider,
-		httpServer:   httpServer,
+		cfg:        cfg,
+		devices:    devices,
+		oauth:      oauthProvider,
+		httpServer: httpServer,
 	}, nil
 }
 
 func (s *Server) ListenAndServe() error {
-	go func() {
-		if err := s.deviceServer.Serve(); err != nil {
-			slog.Error("ShellCore listener stopped", "error", err)
-		}
-	}()
-
-	slog.Info("zshell MCP gateway listening", "address", "http://"+s.cfg.ListenAddr)
-	slog.Info("zshell MCP public base", "url", s.cfg.PublicBase)
-	slog.Info("zshell ShellCore listener", "address", s.cfg.DeviceListen)
+	slog.Info("zshell gateway listening", "address", "http://"+s.cfg.ListenAddr)
+	slog.Info("zshell public base", "url", s.cfg.PublicBase)
+	slog.Info("zshell ShellCore WebSocket endpoint", "path", "/device/ws")
 	return s.httpServer.ListenAndServe()
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	_ = s.deviceServer.Close()
 	s.devices.Close()
 	return s.httpServer.Shutdown(ctx)
 }

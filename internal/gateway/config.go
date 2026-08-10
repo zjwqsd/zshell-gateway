@@ -8,18 +8,14 @@ import (
 	"strings"
 )
 
-const (
-	defaultMCPListen    = "127.0.0.1:8765"
-	defaultDeviceListen = "0.0.0.0:8767"
-)
+const defaultMCPListen = "127.0.0.1:8765"
 
 type Config struct {
-	ListenAddr   string
-	DeviceListen string
-	DeviceToken  string
-	PublicBase   string
-	AdminPIN     string
-	JWTSecret    string
+	ListenAddr  string
+	DeviceToken string
+	PublicBase  string
+	AdminPIN    string
+	JWTSecret   string
 }
 
 func LoadConfig() (Config, error) {
@@ -29,14 +25,6 @@ func LoadConfig() (Config, error) {
 	}
 	if _, _, err := net.SplitHostPort(listenAddr); err != nil {
 		return Config{}, fmt.Errorf("ZSHELL_MCP_LISTEN must be host:port: %w", err)
-	}
-
-	deviceListen := strings.TrimSpace(os.Getenv("ZSHELL_DEVICE_LISTEN"))
-	if deviceListen == "" {
-		deviceListen = defaultDeviceListen
-	}
-	if _, _, err := net.SplitHostPort(deviceListen); err != nil {
-		return Config{}, fmt.Errorf("ZSHELL_DEVICE_LISTEN must be host:port: %w", err)
 	}
 
 	deviceToken := strings.TrimSpace(os.Getenv("ZSHELL_DEVICE_TOKEN"))
@@ -70,12 +58,11 @@ func LoadConfig() (Config, error) {
 	}
 
 	return Config{
-		ListenAddr:   listenAddr,
-		DeviceListen: deviceListen,
-		DeviceToken:  deviceToken,
-		PublicBase:   publicBase,
-		AdminPIN:     adminPIN,
-		JWTSecret:    jwtSecret,
+		ListenAddr:  listenAddr,
+		DeviceToken: deviceToken,
+		PublicBase:  publicBase,
+		AdminPIN:    adminPIN,
+		JWTSecret:   jwtSecret,
 	}, nil
 }
 
