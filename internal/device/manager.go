@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -13,30 +14,65 @@ import (
 )
 
 var (
-	ErrNoDevice       = errors.New("no device connected")
-	ErrDeviceRequired = errors.New("multiple devices connected; device is required")
-	ErrDeviceNotFound = errors.New("device not found")
+	ErrNoDevice        = errors.New("no device connected")
+	ErrDeviceRequired  = errors.New("multiple devices connected; device is required")
+	ErrDeviceNotFound  = errors.New("device not found")
+	ErrTransportClosed = errors.New("device transport closed")
+)
+
+const (
+	heartbeatInterval  = 10 * time.Second
+	heartbeatTimeout   = 10 * time.Second
+	heartbeatFailLimit = 3
 )
 
 type messageTransport interface {
 	Send(any) error
 	Receive(any) error
-	SetDeadline(time.Time) error
 	Close() error
 }
 
 type Manager struct {
 	mu         sync.RWMutex
-	sessions   map[string]*Session
+	devices    map[string]*Device
 	nextCallID atomic.Uint64
 }
 
+// Device is the durable identity known to the Gateway. Its current WebSocket
+// session is replaceable: losing a transport marks the device offline without
+// conflating the device identity with that particular socket.
+type Device struct {
+	info     Info
+	session  *Session
+	lastSeen time.Time
+}
+
+type pendingKind uint8
+
+const (
+	pendingCall pendingKind = iota
+	pendingPing
+)
+
+type pendingResponse struct {
+	kind pendingKind
+	ch   chan wireResponse
+}
+
+// Session owns one live transport. Exactly one goroutine reads from transport;
+// concurrent callers only register response waiters and serialize writes.
 type Session struct {
 	manager   *Manager
 	transport messageTransport
 	info      Info
-	callMu    sync.Mutex
-	closed    sync.Once
+
+	sendMu      sync.Mutex
+	pendingMu   sync.Mutex
+	pending     map[uint64]*pendingResponse
+	activeCalls atomic.Int64
+
+	done   chan struct{}
+	closed sync.Once
 }
 
 type ConnectedDevice struct {
@@ -49,7 +85,7 @@ type ConnectedDevice struct {
 }
 
 func NewManager() *Manager {
-	return &Manager{sessions: make(map[string]*Session)}
+	return &Manager{devices: make(map[string]*Device)}
 }
 
 func normalizeInfo(info Info) (Info, bool) {
@@ -75,19 +111,38 @@ func (m *Manager) Attach(transport messageTransport, info Info) (*Session, bool)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, exists := m.sessions[info.Name]; exists {
+
+	device := m.devices[info.Name]
+	if device == nil {
+		device = &Device{}
+		m.devices[info.Name] = device
+	} else if device.session != nil {
+		// A healthy same-name session must be explicitly detached before the
+		// identity can bind a replacement transport.
 		return nil, false
 	}
-	session := &Session{manager: m, transport: transport, info: info}
-	m.sessions[info.Name] = session
+
+	session := &Session{
+		manager:   m,
+		transport: transport,
+		info:      info,
+		pending:   make(map[uint64]*pendingResponse),
+		done:      make(chan struct{}),
+	}
+	device.info = info
+	device.session = session
+	device.lastSeen = time.Now()
 	return session, true
 }
 
 func (m *Manager) List() []ConnectedDevice {
 	m.mu.RLock()
-	devices := make([]ConnectedDevice, 0, len(m.sessions))
-	for _, session := range m.sessions {
-		devices = append(devices, session.device())
+	devices := make([]ConnectedDevice, 0, len(m.devices))
+	for _, device := range m.devices {
+		if device.session == nil {
+			continue
+		}
+		devices = append(devices, connectedDevice(device.info))
 	}
 	m.mu.RUnlock()
 
@@ -97,30 +152,46 @@ func (m *Manager) List() []ConnectedDevice {
 	return devices
 }
 
+func connectedDevice(info Info) ConnectedDevice {
+	return ConnectedDevice{
+		Name:      info.Name,
+		Workspace: info.Workspace,
+		OS:        info.OS,
+		Arch:      info.Arch,
+		Version:   info.Version,
+		Transport: "websocket",
+	}
+}
+
 func (m *Manager) resolve(name string) (*Session, error) {
 	name = strings.TrimSpace(name)
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if name != "" {
-		session := m.sessions[name]
-		if session == nil {
+		device := m.devices[name]
+		if device == nil || device.session == nil {
 			return nil, ErrDeviceNotFound
 		}
-		return session, nil
+		return device.session, nil
 	}
 
-	switch len(m.sessions) {
-	case 0:
-		return nil, ErrNoDevice
-	case 1:
-		for _, session := range m.sessions {
-			return session, nil
+	var only *Session
+	count := 0
+	for _, device := range m.devices {
+		if device.session == nil {
+			continue
 		}
-		panic("unreachable")
-	default:
-		return nil, ErrDeviceRequired
+		count++
+		only = device.session
+		if count > 1 {
+			return nil, ErrDeviceRequired
+		}
 	}
+	if count == 0 {
+		return nil, ErrNoDevice
+	}
+	return only, nil
 }
 
 func (m *Manager) Call(ctx context.Context, name, operation string, arguments json.RawMessage) (Result, *Failure, error) {
@@ -130,41 +201,88 @@ func (m *Manager) Call(ctx context.Context, name, operation string, arguments js
 	}
 
 	result, failure, err := session.call(ctx, m.nextCallID.Add(1), operation, arguments)
-	if err != nil {
+	if err == nil {
+		return result, failure, nil
+	}
+
+	// Cancellation/deadline of one MCP request is not evidence that the device
+	// transport is dead. Only transport failures detach the current session.
+	if errors.Is(err, ErrTransportClosed) {
 		m.Detach(session)
 		if strings.TrimSpace(name) != "" {
 			return Result{}, nil, ErrDeviceNotFound
 		}
 		return Result{}, nil, ErrNoDevice
 	}
-	return result, failure, nil
+	return Result{}, nil, err
+}
+
+// Serve is the sole reader for a live Session. All results and pongs are
+// demultiplexed by request id to their waiting caller.
+func (m *Manager) Serve(session *Session) error {
+	err := session.readLoop()
+	m.Detach(session)
+	return err
 }
 
 func (m *Manager) Ping(session *Session, timeout time.Duration) error {
 	if !m.isAttached(session) {
-		return ErrNoDevice
+		return ErrTransportClosed
 	}
-	if err := session.ping(m.nextCallID.Add(1), timeout); err != nil {
-		m.Detach(session)
-		return err
-	}
-	return nil
+	return session.ping(m.nextCallID.Add(1), timeout)
 }
 
 func (m *Manager) Monitor(session *Session) {
-	ticker := time.NewTicker(3 * time.Second)
+	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
-	for range ticker.C {
-		if err := m.Ping(session, 3*time.Second); err != nil {
+
+	failures := 0
+	for {
+		select {
+		case <-session.done:
 			return
+		case <-ticker.C:
+			// ShellCore handles calls synchronously. Do not inject a heartbeat
+			// behind an active command and then mistake the delayed pong for death.
+			if session.activeCalls.Load() > 0 {
+				failures = 0
+				continue
+			}
+
+			err := m.Ping(session, heartbeatTimeout)
+			if err == nil {
+				failures = 0
+				continue
+			}
+			if errors.Is(err, ErrTransportClosed) {
+				slog.Warn("ShellCore heartbeat transport failed",
+					"device", session.info.Name,
+					"error", err,
+				)
+				m.Detach(session)
+				return
+			}
+
+			failures++
+			slog.Warn("ShellCore heartbeat missed",
+				"device", session.info.Name,
+				"failure", failures,
+				"limit", heartbeatFailLimit,
+				"error", err,
+			)
+			if failures >= heartbeatFailLimit {
+				m.Detach(session)
+				return
+			}
 		}
 	}
 }
 
 func (m *Manager) Detach(session *Session) {
 	m.mu.Lock()
-	if current := m.sessions[session.info.Name]; current == session {
-		delete(m.sessions, session.info.Name)
+	if device := m.devices[session.info.Name]; device != nil && device.session == session {
+		device.session = nil
+		device.lastSeen = time.Now()
 	}
 	m.mu.Unlock()
 	session.close()
@@ -172,10 +290,13 @@ func (m *Manager) Detach(session *Session) {
 
 func (m *Manager) Close() {
 	m.mu.Lock()
-	sessions := make([]*Session, 0, len(m.sessions))
-	for name, session := range m.sessions {
-		delete(m.sessions, name)
-		sessions = append(sessions, session)
+	sessions := make([]*Session, 0, len(m.devices))
+	for _, device := range m.devices {
+		if device.session != nil {
+			sessions = append(sessions, device.session)
+			device.session = nil
+			device.lastSeen = time.Now()
+		}
 	}
 	m.mu.Unlock()
 
@@ -187,24 +308,49 @@ func (m *Manager) Close() {
 func (m *Manager) isAttached(session *Session) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.sessions[session.info.Name] == session
+	device := m.devices[session.info.Name]
+	return device != nil && device.session == session
 }
 
-func (s *Session) device() ConnectedDevice {
-	return ConnectedDevice{
-		Name:      s.info.Name,
-		Workspace: s.info.Workspace,
-		OS:        s.info.OS,
-		Arch:      s.info.Arch,
-		Version:   s.info.Version,
-		Transport: "websocket",
+func (m *Manager) touch(session *Session) {
+	m.mu.Lock()
+	if device := m.devices[session.info.Name]; device != nil && device.session == session {
+		device.lastSeen = time.Now()
 	}
+	m.mu.Unlock()
 }
 
 func (s *Session) close() {
 	s.closed.Do(func() {
+		close(s.done)
 		_ = s.transport.Close()
+
+		s.pendingMu.Lock()
+		s.pending = make(map[uint64]*pendingResponse)
+		s.activeCalls.Store(0)
+		s.pendingMu.Unlock()
 	})
+}
+
+func (s *Session) readLoop() error {
+	for {
+		var response wireResponse
+		if err := s.transport.Receive(&response); err != nil {
+			return fmt.Errorf("%w: receive: %v", ErrTransportClosed, err)
+		}
+		if response.Type != "result" && response.Type != "pong" {
+			return fmt.Errorf("%w: unsupported response type %q", ErrTransportClosed, response.Type)
+		}
+
+		s.manager.touch(s)
+		pending := s.takePending(response.ID)
+		if pending == nil {
+			// Expected for a late response whose upstream MCP request was already
+			// cancelled or whose heartbeat timed out.
+			continue
+		}
+		pending.ch <- response
+	}
 }
 
 func (s *Session) call(ctx context.Context, id uint64, operation string, arguments json.RawMessage) (Result, *Failure, error) {
@@ -214,70 +360,133 @@ func (s *Session) call(ctx context.Context, id uint64, operation string, argumen
 	if !json.Valid(arguments) {
 		return Result{}, nil, fmt.Errorf("arguments for %q are not valid JSON", operation)
 	}
-
-	s.callMu.Lock()
-	defer s.callMu.Unlock()
-	if err := applyDeadline(s.transport, ctx); err != nil {
-		return Result{}, nil, err
-	}
-	defer clearDeadline(s.transport)
-
-	if err := s.transport.Send(callMessage{Type: "call", ID: id, Operation: operation, Arguments: arguments}); err != nil {
+	if err := ctx.Err(); err != nil {
 		return Result{}, nil, err
 	}
 
-	var response wireResponse
-	if err := s.transport.Receive(&response); err != nil {
+	pending, err := s.registerPending(id, pendingCall)
+	if err != nil {
 		return Result{}, nil, err
 	}
-	if response.Type != "result" || response.ID != id || len(response.Payload) == 0 {
-		return Result{}, nil, fmt.Errorf("invalid response for device call %d", id)
+	s.activeCalls.Add(1)
+
+	if err := s.send(callMessage{Type: "call", ID: id, Operation: operation, Arguments: arguments}); err != nil {
+		s.unregisterPending(id)
+		return Result{}, nil, err
 	}
 
-	var envelope callEnvelope
-	if err := json.Unmarshal(response.Payload, &envelope); err != nil {
-		return Result{}, nil, fmt.Errorf("decode device call envelope: %w", err)
-	}
-	if !envelope.OK {
-		if envelope.Error == nil {
-			return Result{}, nil, fmt.Errorf("device returned failed response without an error")
+	select {
+	case response := <-pending.ch:
+		if response.Type != "result" || response.ID != id || len(response.Payload) == 0 {
+			return Result{}, nil, fmt.Errorf("invalid response for device call %d", id)
 		}
-		return Result{}, envelope.Error, nil
+
+		var envelope callEnvelope
+		if err := json.Unmarshal(response.Payload, &envelope); err != nil {
+			return Result{}, nil, fmt.Errorf("decode device call envelope: %w", err)
+		}
+		if !envelope.OK {
+			if envelope.Error == nil {
+				return Result{}, nil, fmt.Errorf("device returned failed response without an error")
+			}
+			return Result{}, envelope.Error, nil
+		}
+		if len(envelope.Result) == 0 {
+			return Result{}, nil, fmt.Errorf("device returned success without a result")
+		}
+		return Result{Structured: envelope.Result, IsError: envelope.IsError}, nil, nil
+	case <-ctx.Done():
+		// Keep the pending slot until the Core eventually responds. The sole
+		// reader must still consume that response so the shared transport stays
+		// synchronized for subsequent calls.
+		return Result{}, nil, ctx.Err()
+	case <-s.done:
+		return Result{}, nil, ErrTransportClosed
 	}
-	if len(envelope.Result) == 0 {
-		return Result{}, nil, fmt.Errorf("device returned success without a result")
-	}
-	return Result{Structured: envelope.Result, IsError: envelope.IsError}, nil, nil
 }
 
 func (s *Session) ping(id uint64, timeout time.Duration) error {
-	s.callMu.Lock()
-	defer s.callMu.Unlock()
-	if err := s.transport.SetDeadline(time.Now().Add(timeout)); err != nil {
+	pending, err := s.registerPending(id, pendingPing)
+	if err != nil {
 		return err
 	}
-	defer clearDeadline(s.transport)
+	if err := s.send(pingMessage{Type: "ping", ID: id}); err != nil {
+		s.unregisterPending(id)
+		return err
+	}
 
-	if err := s.transport.Send(pingMessage{Type: "ping", ID: id}); err != nil {
-		return err
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case response := <-pending.ch:
+		if response.Type != "pong" || response.ID != id {
+			return fmt.Errorf("invalid device pong for %d", id)
+		}
+		return nil
+	case <-timer.C:
+		s.unregisterPending(id)
+		return fmt.Errorf("heartbeat timeout after %s", timeout)
+	case <-s.done:
+		s.unregisterPending(id)
+		return ErrTransportClosed
 	}
-	var response wireResponse
-	if err := s.transport.Receive(&response); err != nil {
-		return err
+}
+
+func (s *Session) registerPending(id uint64, kind pendingKind) (*pendingResponse, error) {
+	select {
+	case <-s.done:
+		return nil, ErrTransportClosed
+	default:
 	}
-	if response.Type != "pong" || response.ID != id {
-		return fmt.Errorf("invalid device pong for %d", id)
+
+	pending := &pendingResponse{kind: kind, ch: make(chan wireResponse, 1)}
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	if _, exists := s.pending[id]; exists {
+		return nil, fmt.Errorf("duplicate pending request id %d", id)
+	}
+	s.pending[id] = pending
+	return pending, nil
+}
+
+func (s *Session) takePending(id uint64) *pendingResponse {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	pending := s.pending[id]
+	if pending == nil {
+		return nil
+	}
+	delete(s.pending, id)
+	if pending.kind == pendingCall {
+		s.activeCalls.Add(-1)
+	}
+	return pending
+}
+
+func (s *Session) unregisterPending(id uint64) {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	pending := s.pending[id]
+	if pending == nil {
+		return
+	}
+	delete(s.pending, id)
+	if pending.kind == pendingCall {
+		s.activeCalls.Add(-1)
+	}
+}
+
+func (s *Session) send(value any) error {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+
+	select {
+	case <-s.done:
+		return ErrTransportClosed
+	default:
+	}
+	if err := s.transport.Send(value); err != nil {
+		return fmt.Errorf("%w: send: %v", ErrTransportClosed, err)
 	}
 	return nil
-}
-
-func applyDeadline(transport messageTransport, ctx context.Context) error {
-	if deadline, ok := ctx.Deadline(); ok {
-		return transport.SetDeadline(deadline)
-	}
-	return transport.SetDeadline(time.Time{})
-}
-
-func clearDeadline(transport messageTransport) {
-	_ = transport.SetDeadline(time.Time{})
 }

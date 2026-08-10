@@ -94,8 +94,16 @@ func (h *webSocketHandler) handle(conn *websocket.Conn) {
 		"transport", "websocket",
 		"remote", conn.Request().RemoteAddr,
 	)
-	h.manager.Monitor(session)
-	h.manager.Detach(session)
+
+	go h.manager.Monitor(session)
+	err := h.manager.Serve(session)
+	if err != nil {
+		slog.Warn("ShellCore transport ended",
+			"device", session.info.Name,
+			"transport", "websocket",
+			"error", err,
+		)
+	}
 	slog.Info("ShellCore disconnected", "device", session.info.Name, "transport", "websocket")
 }
 
