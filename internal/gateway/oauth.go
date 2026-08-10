@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"html/template"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -28,9 +29,9 @@ const (
 )
 
 type oauthClient struct {
-	ID           string
-	Name         string
-	RedirectURIs []string
+	ID           string   `json:"id"`
+	Name         string   `json:"name,omitempty"`
+	RedirectURIs []string `json:"redirect_uris"`
 }
 
 type authorizationCode struct {
@@ -48,9 +49,10 @@ type OAuthProvider struct {
 	adminPIN   string
 	jwtSecret  string
 
-	mu      sync.Mutex
-	clients map[string]oauthClient
-	codes   map[string]authorizationCode
+	mu          sync.Mutex
+	clients     map[string]oauthClient
+	codes       map[string]authorizationCode
+	clientsFile string
 }
 
 type authorizeParams struct {
@@ -137,7 +139,7 @@ func (p *OAuthProvider) HandleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, redirectURI := range input.RedirectURIs {
 		if !validRedirectURI(redirectURI) {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must be an absolute URI without a fragment")
+			writeOAuthError(w, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri must use HTTPS, except loopback HTTP callbacks")
 			return
 		}
 	}
@@ -164,6 +166,12 @@ func (p *OAuthProvider) HandleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.clients[clientID] = client
+	if err := p.saveClientsLocked(); err != nil {
+		delete(p.clients, clientID)
+		p.mu.Unlock()
+		http.Error(w, "failed to persist OAuth client registration", http.StatusInternalServerError)
+		return
+	}
 	p.mu.Unlock()
 
 	clientName := input.ClientName
@@ -490,13 +498,22 @@ func validRedirectURI(raw string) bool {
 		}
 	}
 	parsed, err := url.Parse(raw)
-	if err != nil || !parsed.IsAbs() || parsed.Scheme == "" || parsed.Fragment != "" {
+	if err != nil || !parsed.IsAbs() || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
 		return false
 	}
-	if strings.EqualFold(parsed.Scheme, "http") || strings.EqualFold(parsed.Scheme, "https") {
-		return parsed.Host != "" && parsed.User == nil
+	switch strings.ToLower(parsed.Scheme) {
+	case "https":
+		return true
+	case "http":
+		host := strings.ToLower(parsed.Hostname())
+		if host == "localhost" {
+			return true
+		}
+		ip := net.ParseIP(host)
+		return ip != nil && ip.IsLoopback()
+	default:
+		return false
 	}
-	return true
 }
 
 func validPKCEChallenge(value string) bool {

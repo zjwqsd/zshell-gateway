@@ -54,6 +54,7 @@ Optional:
 
 ```text
 ZSHELL_MCP_LISTEN=127.0.0.1:8765
+ZSHELL_OAUTH_CLIENTS_FILE=/var/lib/zshell-gateway/oauth-clients.json
 ```
 
 For a direct LAN deployment, bind the single HTTP service to a LAN interface, for example:
@@ -92,4 +93,6 @@ go build ./cmd/zshell-gateway
 - Public ShellCore connections must use `wss://` so TLS protects the token and device traffic.
 - WebSocket messages are capped at 8 MiB.
 - The HTTP server applies header/read timeouts; the device registry rejects duplicate live names.
+- OAuth dynamic client registrations are persisted across Gateway restarts. Only client metadata is stored; access tokens, Admin PINs and authorization codes are not written to this file.
+- OAuth redirect URIs must use HTTPS, except loopback HTTP callbacks. Authorization still requires an exact match to the registered redirect URI.
 - Stopping a Core closes its WebSocket and removes the device from the live registry.

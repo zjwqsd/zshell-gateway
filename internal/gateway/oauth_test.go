@@ -23,7 +23,9 @@ func TestRedirectURIs(t *testing.T) {
 	valid := []string{
 		"https://chatgpt.com/oauth/callback",
 		"http://127.0.0.1:9876/callback",
-		"com.example.app:/oauth/callback",
+		"http://127.0.0.2:9876/callback",
+		"http://localhost:9876/callback",
+		"http://[::1]:9876/callback",
 	}
 	for _, uri := range valid {
 		if !validRedirectURI(uri) {
@@ -34,6 +36,9 @@ func TestRedirectURIs(t *testing.T) {
 		"/relative/callback",
 		"https:///missing-host",
 		"https://example.com/callback#fragment",
+		"http://example.com/callback",
+		"com.example.app:/oauth/callback",
+		"https://user@example.com/callback",
 	}
 	for _, uri := range invalid {
 		if validRedirectURI(uri) {

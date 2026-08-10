@@ -22,7 +22,10 @@ type Server struct {
 
 func NewServer(cfg Config) (*Server, error) {
 	devices := device.NewManager()
-	oauthProvider := NewOAuthProvider(cfg.PublicBase, cfg.AdminPIN, cfg.JWTSecret)
+	oauthProvider, err := NewPersistentOAuthProvider(cfg.PublicBase, cfg.AdminPIN, cfg.JWTSecret, cfg.OAuthClientsFile)
+	if err != nil {
+		return nil, err
+	}
 
 	mcpServer := mcp.NewServer(&mcp.Implementation{
 		Name:    "zshell",
@@ -90,6 +93,7 @@ func NewServer(cfg Config) (*Server, error) {
 func (s *Server) ListenAndServe() error {
 	slog.Info("zshell gateway listening", "address", "http://"+s.cfg.ListenAddr)
 	slog.Info("zshell public base", "url", s.cfg.PublicBase)
+	slog.Info("zshell OAuth client registry", "file", s.cfg.OAuthClientsFile)
 	slog.Info("zshell ShellCore WebSocket endpoint", "path", "/device/ws")
 	return s.httpServer.ListenAndServe()
 }
