@@ -419,10 +419,60 @@ func formatToolText(name string, value map[string]any) string {
 		)
 	case "file_mkdir":
 		return fmt.Sprintf("path: %s\nrecursive: %t", stringField(value, "path"), boolField(value, "recursive"))
+	case "browser_status":
+		return formatBrowserStatus(value)
+	case "browser_snapshot":
+		data := mapField(value, "data")
+		if snapshot := stringField(data, "snapshot"); snapshot != "" {
+			return snapshot
+		}
+		encoded, _ := json.Marshal(value)
+		return string(encoded)
+	case "browser_get":
+		data := mapField(value, "data")
+		if title := stringField(data, "title"); title != "" {
+			return title
+		}
+		if url := stringField(data, "url"); url != "" {
+			return url
+		}
+		encoded, _ := json.Marshal(value)
+		return string(encoded)
+	case "browser_takeover":
+		browser := mapField(value, "browser")
+		text := formatBrowserStatus(browser)
+		if boolField(value, "snapshotRequired") {
+			text += "\nFresh browser_snapshot required before ref-based actions."
+		}
+		return text
 	default:
 		encoded, _ := json.Marshal(value)
 		return string(encoded)
 	}
+}
+
+func formatBrowserStatus(value map[string]any) string {
+	available := boolField(value, "available")
+	active := boolField(value, "active")
+	var b strings.Builder
+	fmt.Fprintf(&b, "available: %t\nactive: %t", available, active)
+	if mode := stringField(value, "mode"); mode != "" {
+		fmt.Fprintf(&b, "\nmode: %s", mode)
+	}
+	fmt.Fprintf(&b, "\nvisible: %t", boolField(value, "visible"))
+	if owner := stringField(value, "owner"); owner != "" {
+		fmt.Fprintf(&b, "\nowner: %s", owner)
+	}
+	if profile := stringField(value, "profile"); profile != "" {
+		fmt.Fprintf(&b, "\nprofile: %s", profile)
+	}
+	if executable := stringField(value, "agentBrowserExecutable"); executable != "" {
+		fmt.Fprintf(&b, "\nagent-browser: %s", executable)
+	}
+	if executable := stringField(value, "browserExecutable"); executable != "" {
+		fmt.Fprintf(&b, "\nbrowser: %s", executable)
+	}
+	return b.String()
 }
 
 func stringField(value map[string]any, name string) string {
@@ -525,6 +575,36 @@ func streamReadSchema(idName, idDescription string) map[string]any {
 		"stdoutAfter": outputCursorProperty("stdout"),
 		"stderrAfter": outputCursorProperty("stderr"),
 	}, idName)
+}
+
+func stringProperty(description string) map[string]any {
+	return map[string]any{
+		"type":        "string",
+		"description": description,
+	}
+}
+
+func enumStringProperty(description string, values ...string) map[string]any {
+	return map[string]any{
+		"type":        "string",
+		"description": description,
+		"enum":        values,
+	}
+}
+
+func boolProperty(description string) map[string]any {
+	return map[string]any{
+		"type":        "boolean",
+		"description": description,
+	}
+}
+
+func browserRefProperty(description string) map[string]any {
+	return map[string]any{
+		"type":        "string",
+		"description": description + " Use a ref returned by browser_snapshot, such as e1 or @e1.",
+		"pattern":     "^@?e[0-9]+$",
+	}
 }
 
 func toolSpecs() []toolSpec {
@@ -699,6 +779,140 @@ func toolSpecs() []toolSpec {
 					"type": "boolean", "description": "Create missing parent directories. Defaults to true.",
 				},
 			}, "path"),
+		},
+		{
+			Name:        "browser_status",
+			Description: "Return zshell browser availability, active session state, ownership, profile mode, and discovered agent-browser/browser executables.",
+			InputSchema: empty(),
+			ReadOnly:    true,
+		},
+		{
+			Name:        "browser_start",
+			Description: "Start the zshell-managed browser session. temporary mode is isolated and disposable; persistent mode stores zshell-managed profile state; chrome_profile reuses a named installed Chrome profile. Set visible=true when the user may take over the browser.",
+			InputSchema: objectSchema(map[string]any{
+				"mode":    enumStringProperty("Browser session mode. Defaults to temporary.", "temporary", "persistent", "chrome_profile"),
+				"visible": boolProperty("Show the browser window. Defaults to false. Required for human takeover."),
+				"profile": stringProperty("Optional profile name. persistent defaults to default; chrome_profile requires a Chrome profile name."),
+			}),
+		},
+		{
+			Name:        "browser_open",
+			Description: "Navigate the active zshell browser tab to a URL.",
+			InputSchema: objectSchema(map[string]any{
+				"url": commandProperty("URL to open."),
+			}, "url"),
+		},
+		{
+			Name:        "browser_snapshot",
+			Description: "Return the accessibility snapshot and stable element refs for the active page. Use refs from this result with browser_click, browser_fill, browser_select, browser_check, browser_upload, and browser_download.",
+			InputSchema: objectSchema(map[string]any{
+				"interactiveOnly": boolProperty("Return only interactive elements. Defaults to true."),
+			}),
+			ReadOnly: true,
+		},
+		{
+			Name:        "browser_click",
+			Description: "Click an element ref from browser_snapshot.",
+			InputSchema: objectSchema(map[string]any{
+				"ref":    browserRefProperty("Element to click."),
+				"newTab": boolProperty("Open the click target in a new tab when supported. Defaults to false."),
+			}, "ref"),
+		},
+		{
+			Name:        "browser_fill",
+			Description: "Clear and fill an input element identified by a browser_snapshot ref.",
+			InputSchema: objectSchema(map[string]any{
+				"ref":  browserRefProperty("Input element to fill."),
+				"text": stringProperty("Text to enter."),
+			}, "ref", "text"),
+		},
+		{
+			Name:        "browser_select",
+			Description: "Select a value in a select element identified by a browser_snapshot ref.",
+			InputSchema: objectSchema(map[string]any{
+				"ref":   browserRefProperty("Select element."),
+				"value": stringProperty("Option value or label to select."),
+			}, "ref", "value"),
+		},
+		{
+			Name:        "browser_check",
+			Description: "Check or uncheck a checkbox/radio-like element identified by a browser_snapshot ref.",
+			InputSchema: objectSchema(map[string]any{
+				"ref":     browserRefProperty("Element to check or uncheck."),
+				"checked": boolProperty("Desired checked state. Defaults to true."),
+			}, "ref"),
+		},
+		{
+			Name:        "browser_press",
+			Description: "Press a keyboard key in the active browser page, such as Enter, Tab, Escape, or Control+a.",
+			InputSchema: objectSchema(map[string]any{
+				"key": commandProperty("Key or key chord to press."),
+			}, "key"),
+		},
+		{
+			Name:        "browser_upload",
+			Description: "Upload one or more local device files through a file-input element identified by a browser_snapshot ref.",
+			InputSchema: objectSchema(map[string]any{
+				"ref": browserRefProperty("File input element."),
+				"files": map[string]any{
+					"type": "array", "description": "Local file paths on the selected ShellCore device.", "minItems": 1, "maxItems": 16,
+					"items": pathProperty("Local file path to upload."),
+				},
+			}, "ref", "files"),
+		},
+		{
+			Name:        "browser_download",
+			Description: "Click a downloadable element ref and save the result to a local path on the selected ShellCore device.",
+			InputSchema: objectSchema(map[string]any{
+				"ref":  browserRefProperty("Download element."),
+				"path": pathProperty("Destination path on the selected ShellCore device."),
+			}, "ref", "path"),
+		},
+		{
+			Name:        "browser_tabs",
+			Description: "List, create, switch, or close browser tabs. Tab IDs such as t1 are returned by the list action.",
+			InputSchema: objectSchema(map[string]any{
+				"action": enumStringProperty("Tab action. Defaults to list.", "list", "new", "switch", "close"),
+				"tab":    stringProperty("Tab ID, label, or target ID for switch/close."),
+				"url":    stringProperty("Optional URL for a new tab."),
+				"label":  stringProperty("Optional stable label for a new tab."),
+			}),
+		},
+		{
+			Name:        "browser_wait",
+			Description: "Wait for the active page to reach a load state.",
+			InputSchema: objectSchema(map[string]any{
+				"state": enumStringProperty("Page load state to wait for.", "load", "domcontentloaded", "networkidle"),
+			}, "state"),
+			ReadOnly: true,
+		},
+		{
+			Name:        "browser_get",
+			Description: "Return the current browser page URL or title.",
+			InputSchema: objectSchema(map[string]any{
+				"what": enumStringProperty("Page information to return.", "url", "title"),
+			}, "what"),
+			ReadOnly: true,
+		},
+		{
+			Name:        "browser_screenshot",
+			Description: "Capture the active browser page to an image file on the selected ShellCore device. Use file_read afterwards if the image bytes are needed.",
+			InputSchema: objectSchema(map[string]any{
+				"path": pathProperty("Optional output path. If omitted, agent-browser chooses a temporary screenshot path."),
+				"full": boolProperty("Capture the full page instead of the viewport. Defaults to false."),
+			}),
+		},
+		{
+			Name:        "browser_takeover",
+			Description: "Transfer browser ownership between agent and human. Human takeover requires a visible browser. After control returns to agent, take a fresh browser_snapshot before reusing refs.",
+			InputSchema: objectSchema(map[string]any{
+				"owner": enumStringProperty("New browser owner.", "human", "agent"),
+			}, "owner"),
+		},
+		{
+			Name:        "browser_close",
+			Description: "Close the active zshell-managed browser session.",
+			InputSchema: empty(),
 		},
 	}
 }
