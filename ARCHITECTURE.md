@@ -24,9 +24,9 @@ The old dedicated device TCP transport has been removed. There is no length-pref
 
 1. ShellCore opens `ws://.../device/ws` or `wss://.../device/ws`.
 2. The HTTP Upgrade request carries `Authorization: Bearer <device token>`.
-3. After the WebSocket upgrade, Core sends `hello(protocol=2, device={...})`.
+3. After the WebSocket upgrade, Core sends `hello(protocol=3, device={...})`.
 4. The gateway validates metadata and rejects duplicate live device names.
-5. The persistent WebSocket carries application JSON messages in both directions.
+5. The persistent WebSocket carries JSON/text control messages and raw binary file-transfer frames.
 
 Application messages:
 
@@ -36,9 +36,26 @@ Core    -> result(id, payload)
 
 Gateway -> ping(id)
 Core    -> pong(id)
+
+Gateway -> transfer_* control messages
+Core    -> transfer_* state messages
+Core    -> ZTF1 binary chunks -> Gateway -> target Core
 ```
 
 WebSocket protocol control frames are handled independently by the WebSocket implementation.
+
+## Transfer routing
+
+The device manager owns transfer lifecycle and routes binary frames between two already-connected sessions. A transfer reserves both device names until it reaches `completed`, `failed`, or `cancelled`. Gateway stores only metadata/progress; file payload is synchronously forwarded to the target session so slow target I/O naturally backpressures the source instead of growing an unbounded Gateway buffer.
+
+The transfer state sequence is:
+
+```text
+preparing -> transferring -> verifying -> completed
+                    \-> failed / cancelled
+```
+
+The source computes SHA-256 while reading. The target independently hashes bytes written to `.zshell-part`. Gateway sends a commit only after every declared source byte has been relayed, and marks completion only after target size/hash matches the source.
 
 ## MCP routing
 
