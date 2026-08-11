@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -44,5 +45,26 @@ func TestSplitDeviceArguments(t *testing.T) {
 	}
 	if fields["command"] != "pwd" {
 		t.Fatalf("command=%v", fields["command"])
+	}
+}
+
+func TestFormatBrowserStatusDisabled(t *testing.T) {
+	text := formatBrowserStatus(map[string]any{
+		"enabled":   false,
+		"available": false,
+		"active":    false,
+	})
+	if text != "enabled: false\navailable: false\nactive: false\nBrowser functionality was not enabled when this ShellCore started.\nvisible: false" {
+		t.Fatalf("unexpected browser status text: %q", text)
+	}
+}
+
+func TestFormatBrowserStatusLegacyCoreDefaultsEnabled(t *testing.T) {
+	text := formatBrowserStatus(map[string]any{
+		"available": true,
+		"active":    false,
+	})
+	if !strings.HasPrefix(text, "enabled: true\navailable: true") {
+		t.Fatalf("legacy browser status should default to enabled: %q", text)
 	}
 }

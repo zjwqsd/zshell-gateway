@@ -216,6 +216,9 @@ func toolFailure(name string, failure *device.Failure) *mcp.CallToolResult {
 	if failure.Code == "HumanControlActive" {
 		text = "Human control is active. This operation was not started."
 	}
+	if failure.Code == "BrowserFeatureDisabled" {
+		text = "Browser functionality is disabled on this ShellCore. Restart that device with --browser to enable browser tools."
+	}
 	result := &mcp.CallToolResult{
 		StructuredContent: structured,
 		IsError:           true,
@@ -452,10 +455,19 @@ func formatToolText(name string, value map[string]any) string {
 }
 
 func formatBrowserStatus(value map[string]any) string {
+	enabled := true
+	if value != nil {
+		if flag, ok := value["enabled"].(bool); ok {
+			enabled = flag
+		}
+	}
 	available := boolField(value, "available")
 	active := boolField(value, "active")
 	var b strings.Builder
-	fmt.Fprintf(&b, "available: %t\nactive: %t", available, active)
+	fmt.Fprintf(&b, "enabled: %t\navailable: %t\nactive: %t", enabled, available, active)
+	if !enabled {
+		b.WriteString("\nBrowser functionality was not enabled when this ShellCore started.")
+	}
 	if mode := stringField(value, "mode"); mode != "" {
 		fmt.Fprintf(&b, "\nmode: %s", mode)
 	}
@@ -782,13 +794,13 @@ func toolSpecs() []toolSpec {
 		},
 		{
 			Name:        "browser_status",
-			Description: "Return zshell browser availability, active session state, ownership, profile mode, and discovered agent-browser/browser executables.",
+			Description: "Return whether browser functionality was enabled for this ShellCore, plus runtime availability, active session state, ownership, profile mode, and discovered executables.",
 			InputSchema: empty(),
 			ReadOnly:    true,
 		},
 		{
 			Name:        "browser_start",
-			Description: "Start the zshell-managed browser session. temporary mode is isolated and disposable; persistent mode stores zshell-managed profile state; chrome_profile reuses a named installed Chrome profile. Set visible=true when the user may take over the browser.",
+			Description: "Start the zshell-managed browser session. The selected ShellCore must have been started with --browser. temporary mode is isolated and disposable; persistent mode stores zshell-managed profile state; chrome_profile reuses a named installed Chrome profile. Set visible=true when the user may take over the browser.",
 			InputSchema: objectSchema(map[string]any{
 				"mode":    enumStringProperty("Browser session mode. Defaults to temporary.", "temporary", "persistent", "chrome_profile"),
 				"visible": boolProperty("Show the browser window. Defaults to false. Required for human takeover."),

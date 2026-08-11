@@ -80,6 +80,17 @@ Core    -> wss://zshell.example.com/device/ws
 
 No additional public device port is required.
 
+## Browser-capability behavior
+
+Browser tools remain registered at Gateway level so one Gateway can serve a mix of browser-enabled and browser-disabled ShellCore devices without changing the MCP tool schema as devices connect and disconnect.
+
+For a Core started without `--browser`:
+
+- `browser_status` reports `enabled=false`
+- any other `browser_*` call returns `BrowserFeatureDisabled` with an explicit message to restart that Core with `--browser`
+
+A browser-enabled Core validates `agent-browser` and Chrome/Chromium before it connects, so Gateway never sees a device claiming enabled browser support with missing startup dependencies.
+
 ## Build and test
 
 ```bash
