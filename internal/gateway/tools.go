@@ -269,8 +269,8 @@ func formatToolText(name string, value map[string]any) string {
 		)
 	case "job_status", "job_stop":
 		var b strings.Builder
-		fmt.Fprintf(&b, "job: %.0f\nstatus: %s\ncommand: %s\n",
-			numberOrZero(value, "jobId"), stringField(value, "status"), stringField(value, "command"))
+		fmt.Fprintf(&b, "job: %.0f\nstatus: %s\nprogram: %s\nargs: %q\n",
+			numberOrZero(value, "jobId"), stringField(value, "status"), stringField(value, "program"), stringArrayField(value, "args"))
 		if cwd := stringField(value, "cwd"); cwd != "" {
 			fmt.Fprintf(&b, "cwd: %s\n", cwd)
 		}
@@ -313,15 +313,19 @@ func formatToolText(name string, value map[string]any) string {
 		for _, raw := range items {
 			item, _ := raw.(map[string]any)
 			fmt.Fprintf(&b, "[%.0f] %s - %s\n",
-				numberOrZero(item, "job_id"), stringField(item, "status"), stringField(item, "command"))
+				numberOrZero(item, "job_id"), stringField(item, "status"), jobInvocationSummary(item))
 		}
 		return b.String()
 	case "shell_start":
 		text := fmt.Sprintf(
-			"shell %.0f started\nstatus: %s\nbackend: %s",
+			"shell %.0f started\nstatus: %s\nbackend: %s\nprogram: %s\nargs: %q\nsize: %.0fx%.0f",
 			numberOrZero(value, "shellId"),
 			stringField(value, "status"),
 			stringField(value, "backend"),
+			stringField(value, "shell"),
+			stringArrayField(value, "args"),
+			numberOrZero(value, "cols"),
+			numberOrZero(value, "rows"),
 		)
 		if cwd := stringField(value, "initialCwd"); cwd != "" {
 			text += "\ninitialCwd: " + cwd
@@ -334,11 +338,19 @@ func formatToolText(name string, value map[string]any) string {
 			numberOrZero(value, "sentBytes"),
 			boolField(value, "enter"),
 		)
+	case "shell_resize":
+		return fmt.Sprintf(
+			"shell: %.0f\nsize: %.0fx%.0f",
+			numberOrZero(value, "shellId"),
+			numberOrZero(value, "cols"),
+			numberOrZero(value, "rows"),
+		)
 	case "shell_read":
 		stdout := mapField(value, "stdout")
 		stderr := mapField(value, "stderr")
-		text := fmt.Sprintf("shell: %.0f\nstatus: %s",
-			numberOrZero(value, "shellId"), stringField(value, "status"))
+		text := fmt.Sprintf("shell: %.0f\nstatus: %s\nbackend: %s\nprogram: %s\nsize: %.0fx%.0f",
+			numberOrZero(value, "shellId"), stringField(value, "status"), stringField(value, "backend"),
+			stringField(value, "shell"), numberOrZero(value, "cols"), numberOrZero(value, "rows"))
 		if source := stringField(value, "terminationSource"); source != "" {
 			text += "\nterminationSource: " + source
 		}
@@ -371,7 +383,9 @@ func formatToolText(name string, value map[string]any) string {
 		var b strings.Builder
 		for _, raw := range items {
 			item, _ := raw.(map[string]any)
-			fmt.Fprintf(&b, "[%.0f] %s", numberOrZero(item, "shellId"), stringField(item, "status"))
+			fmt.Fprintf(&b, "[%.0f] %s - %s %q (%.0fx%.0f)",
+				numberOrZero(item, "shellId"), stringField(item, "status"), stringField(item, "shell"),
+				stringArrayField(item, "args"), numberOrZero(item, "cols"), numberOrZero(item, "rows"))
 			if cwd := stringField(item, "initialCwd"); cwd != "" {
 				fmt.Fprintf(&b, " - %s", cwd)
 			}
@@ -516,6 +530,26 @@ func numberOrZero(value map[string]any, name string) float64 {
 	return number
 }
 
+func stringArrayField(value map[string]any, name string) []string {
+	raw, _ := value[name].([]any)
+	items := make([]string, 0, len(raw))
+	for _, item := range raw {
+		if text, ok := item.(string); ok {
+			items = append(items, text)
+		}
+	}
+	return items
+}
+
+func jobInvocationSummary(value map[string]any) string {
+	var b strings.Builder
+	b.WriteString(stringField(value, "program"))
+	for _, arg := range stringArrayField(value, "args") {
+		fmt.Fprintf(&b, " %q", arg)
+	}
+	return b.String()
+}
+
 func mapField(value map[string]any, name string) map[string]any {
 	if value == nil {
 		return nil
@@ -619,6 +653,23 @@ func browserRefProperty(description string) map[string]any {
 	}
 }
 
+func stringArrayProperty(description string) map[string]any {
+	return map[string]any{
+		"type":        "array",
+		"description": description,
+		"items":       map[string]any{"type": "string"},
+	}
+}
+
+func terminalDimensionProperty(description string) map[string]any {
+	return map[string]any{
+		"type":        "integer",
+		"description": description,
+		"minimum":     1,
+		"maximum":     65535,
+	}
+}
+
 func toolSpecs() []toolSpec {
 	empty := func() map[string]any { return objectSchema(map[string]any{}) }
 	jobID := func(description string) map[string]any {
@@ -643,7 +694,7 @@ func toolSpecs() []toolSpec {
 		},
 		{
 			Name:        "exec",
-			Description: "Execute a shell command and wait for it to finish. Intended for short-lived commands.",
+			Description: "Execute a shell command and wait for it to finish. Uses Bash on Linux and PowerShell on Windows. Intended for short-lived commands.",
 			InputSchema: objectSchema(map[string]any{
 				"command": commandProperty("Shell command to execute."),
 				"cwd": map[string]any{
@@ -660,14 +711,15 @@ func toolSpecs() []toolSpec {
 		},
 		{
 			Name:        "job_start",
-			Description: "Start a long-running shell command in the background and return immediately with a job ID.",
+			Description: "Start a long-running program directly in the background and return immediately with a job ID. Arguments are passed as argv without shell parsing. To run a shell command, explicitly use a shell executable as program (for example /bin/bash with -c).",
 			InputSchema: objectSchema(map[string]any{
-				"command": commandProperty("Shell command to start in the background."),
+				"program": commandProperty("Executable to start directly."),
+				"args":    stringArrayProperty("Optional argv entries passed verbatim to program."),
 				"cwd": map[string]any{
 					"type":        "string",
 					"description": "Optional working directory. May be any path accessible to the current OS user.",
 				},
-			}, "command"),
+			}, "program"),
 		},
 		{
 			Name:        "job_status",
@@ -694,17 +746,21 @@ func toolSpecs() []toolSpec {
 		},
 		{
 			Name:        "shell_start",
-			Description: "Start a persistent shell session whose working directory and shell state survive across writes.",
+			Description: "Start a real interactive terminal session backed by PTY on Linux or ConPTY on Windows. The default is the user's SHELL on Linux and PowerShell on Windows; shell and args may select another interactive shell.",
 			InputSchema: objectSchema(map[string]any{
+				"shell": commandProperty("Optional shell executable, such as zsh, bash, powershell.exe, pwsh.exe, or cmd.exe."),
+				"args":  stringArrayProperty("Optional arguments passed to the shell executable."),
 				"cwd": map[string]any{
 					"type":        "string",
 					"description": "Optional initial working directory. May be any path accessible to the current OS user.",
 				},
+				"cols": terminalDimensionProperty("Initial terminal width in columns. Defaults to 120."),
+				"rows": terminalDimensionProperty("Initial terminal height in rows. Defaults to 30."),
 			}),
 		},
 		{
 			Name:        "shell_write",
-			Description: "Write input to a persistent shell session. By default a platform newline is appended.",
+			Description: "Write raw input to an interactive terminal session. By default a terminal Enter key is sent after the input.",
 			InputSchema: objectSchema(map[string]any{
 				"shellId": idProperty("ID of the persistent shell session."),
 				"input": map[string]any{
@@ -713,15 +769,24 @@ func toolSpecs() []toolSpec {
 				},
 				"enter": map[string]any{
 					"type":        "boolean",
-					"description": "Whether to append a platform newline after the input. Defaults to true.",
+					"description": "Whether to send a terminal Enter key after the input. Defaults to true.",
 				},
 			}, "shellId", "input"),
 		},
 		{
 			Name:        "shell_read",
-			Description: "Read stdout and stderr from a persistent shell session. Optional stdoutAfter/stderrAfter cursors request only output newer than the previous read.",
+			Description: "Read terminal output from an interactive shell session. PTY/ConPTY merges terminal output into stdout; stderr is retained as an empty compatibility stream. Optional cursors request only newer retained output.",
 			InputSchema: streamReadSchema("shellId", "ID of the persistent shell session."),
 			ReadOnly:    true,
+		},
+		{
+			Name:        "shell_resize",
+			Description: "Resize a running PTY/ConPTY terminal session.",
+			InputSchema: objectSchema(map[string]any{
+				"shellId": idProperty("ID of the persistent shell session."),
+				"cols":    terminalDimensionProperty("Terminal width in columns."),
+				"rows":    terminalDimensionProperty("Terminal height in rows."),
+			}, "shellId", "cols", "rows"),
 		},
 		{
 			Name:        "shell_kill",

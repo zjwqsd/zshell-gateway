@@ -68,3 +68,54 @@ func TestFormatBrowserStatusLegacyCoreDefaultsEnabled(t *testing.T) {
 		t.Fatalf("legacy browser status should default to enabled: %q", text)
 	}
 }
+
+func TestJobStartSchemaIsDirectProcessOnly(t *testing.T) {
+	var spec *toolSpec
+	for _, candidate := range toolSpecs() {
+		if candidate.Name == "job_start" {
+			copy := candidate
+			spec = &copy
+			break
+		}
+	}
+	if spec == nil {
+		t.Fatal("job_start tool missing")
+	}
+	properties := spec.InputSchema["properties"].(map[string]any)
+	for _, name := range []string{"program", "args", "cwd"} {
+		if _, ok := properties[name]; !ok {
+			t.Fatalf("job_start schema missing %q", name)
+		}
+	}
+	if _, ok := properties["command"]; ok {
+		t.Fatal("job_start must not expose command shell compatibility")
+	}
+}
+
+func TestFormatDirectJobInvocationPreservesArguments(t *testing.T) {
+	text := formatToolText("job_status", map[string]any{
+		"jobId":   7.0,
+		"status":  "running",
+		"program": "python",
+		"args":    []any{"train.py", "--name", "hello world"},
+	})
+	if !strings.Contains(text, "program: python") || !strings.Contains(text, `"hello world"`) {
+		t.Fatalf("unexpected direct job text: %q", text)
+	}
+}
+
+func TestShellStartSchemaSupportsTerminalSelectionAndSizing(t *testing.T) {
+	for _, spec := range toolSpecs() {
+		if spec.Name != "shell_start" {
+			continue
+		}
+		properties := spec.InputSchema["properties"].(map[string]any)
+		for _, name := range []string{"shell", "args", "cwd", "cols", "rows"} {
+			if _, ok := properties[name]; !ok {
+				t.Fatalf("shell_start schema missing %q", name)
+			}
+		}
+		return
+	}
+	t.Fatal("shell_start tool missing")
+}
