@@ -30,7 +30,7 @@ ShellCore connects outbound to `/device/ws` and authenticates the WebSocket upgr
 Authorization: Bearer <ZSHELL_DEVICE_TOKEN>
 ```
 
-After the upgrade, the same WebSocket carries the device hello, calls, results and liveness messages. Device names are supplied by ShellCore and must be unique while connected.
+After the upgrade, the same WebSocket carries the protocol-v3 device hello, calls, results, liveness messages and cross-device transfer traffic. Device names are supplied by ShellCore and must be unique while connected.
 
 Recommended URLs:
 
@@ -79,6 +79,28 @@ Core    -> wss://zshell.example.com/device/ws
 ```
 
 No additional public device port is required.
+
+## Cross-device file transfer
+
+Gateway exposes three transfer tools:
+
+```text
+file_transfer
+file_transfer_status
+file_transfer_cancel
+```
+
+`file_transfer` names both source and target devices explicitly. Gateway asks both Cores to prepare their local paths, then streams 256 KiB file chunks as raw WebSocket binary frames:
+
+```text
+source Core -> Gateway -> target Core
+```
+
+Gateway does not load the whole file into memory, persist it to disk, base64-encode it, or place file bytes in MCP responses. The synchronous target WebSocket write provides backpressure to the source. Control messages remain JSON/text frames.
+
+The target writes to `<destination>.zshell-part`. Completion requires matching byte counts and SHA-256 digests from source and target before the target file is committed. Cancellation/failure removes the temporary file. In protocol v3, one device can participate in at most one active transfer at a time.
+
+`overwrite` defaults to false. If the destination already exists, target preparation fails before streaming begins.
 
 ## Browser-capability behavior
 

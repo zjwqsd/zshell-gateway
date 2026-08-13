@@ -24,8 +24,28 @@ func (t *webSocketTransport) Send(value any) error {
 	return websocket.JSON.Send(t.conn, value)
 }
 
-func (t *webSocketTransport) Receive(value any) error {
-	return websocket.JSON.Receive(t.conn, value)
+func (t *webSocketTransport) SendBinary(payload []byte) error {
+	return websocket.Message.Send(t.conn, payload)
+}
+
+var receiveFrameCodec = websocket.Codec{
+	Unmarshal: func(data []byte, payloadType byte, target any) error {
+		frame, ok := target.(*transportFrame)
+		if !ok {
+			return fmt.Errorf("unexpected WebSocket frame target %T", target)
+		}
+		frame.Binary = payloadType == websocket.BinaryFrame
+		frame.Data = data
+		return nil
+	},
+}
+
+func (t *webSocketTransport) ReceiveFrame() (transportFrame, error) {
+	var frame transportFrame
+	if err := receiveFrameCodec.Receive(t.conn, &frame); err != nil {
+		return transportFrame{}, err
+	}
+	return frame, nil
 }
 
 func (t *webSocketTransport) SetDeadline(deadline time.Time) error {

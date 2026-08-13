@@ -21,8 +21,161 @@ type toolSpec struct {
 
 func RegisterTools(server *mcp.Server, devices *device.Manager) {
 	registerDeviceList(server, devices)
+	registerTransferTools(server, devices)
 	for _, spec := range toolSpecs() {
 		registerDeviceTool(server, devices, spec)
+	}
+}
+
+func registerTransferTools(server *mcp.Server, devices *device.Manager) {
+	server.AddTool(&mcp.Tool{
+		Name:        "file_transfer",
+		Description: "Transfer one file directly between two connected ShellCore devices. File bytes are streamed through Gateway over WebSocket binary frames and do not pass through the model context. The source and target devices must be different. Each device may participate in at most one active transfer in this protocol version.",
+		InputSchema: objectSchema(map[string]any{
+			"sourceDevice": stringProperty("Connected ShellCore device that owns the source file."),
+			"sourcePath":   pathProperty("Source file path on sourceDevice."),
+			"targetDevice": stringProperty("Connected ShellCore device that will receive the file."),
+			"targetPath":   pathProperty("Destination file path on targetDevice."),
+			"overwrite":    boolProperty("Replace an existing destination file. Defaults to false."),
+		}, "sourceDevice", "sourcePath", "targetDevice", "targetPath"),
+		OutputSchema: map[string]any{"type": "object", "additionalProperties": true},
+		Meta:         mcp.Meta{"securitySchemes": []any{map[string]any{"type": "oauth2", "scopes": []string{executeScope}}}},
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:    false,
+			DestructiveHint: boolPtr(true),
+			IdempotentHint:  false,
+			OpenWorldHint:   boolPtr(false),
+		},
+	}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		var input struct {
+			SourceDevice string `json:"sourceDevice"`
+			SourcePath   string `json:"sourcePath"`
+			TargetDevice string `json:"targetDevice"`
+			TargetPath   string `json:"targetPath"`
+			Overwrite    bool   `json:"overwrite"`
+		}
+		if err := json.Unmarshal(req.Params.Arguments, &input); err != nil {
+			return transferErrorResult("InvalidRequest", "Invalid file_transfer arguments: "+err.Error()), nil
+		}
+		snapshot, err := devices.StartTransfer(ctx, input.SourceDevice, input.SourcePath, input.TargetDevice, input.TargetPath, input.Overwrite)
+		if err != nil {
+			return transferErrorResult(transferErrorCode(err), err.Error()), nil
+		}
+		return transferSnapshotResult(snapshot, snapshot.Status == device.TransferFailed || snapshot.Status == device.TransferCancelled), nil
+	})
+
+	server.AddTool(&mcp.Tool{
+		Name:        "file_transfer_status",
+		Description: "Return current progress and verification state for a cross-device file transfer.",
+		InputSchema: objectSchema(map[string]any{
+			"transferId": stringProperty("Transfer ID returned by file_transfer."),
+		}, "transferId"),
+		OutputSchema: map[string]any{"type": "object", "additionalProperties": true},
+		Meta:         mcp.Meta{"securitySchemes": []any{map[string]any{"type": "oauth2", "scopes": []string{executeScope}}}},
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:    true,
+			DestructiveHint: boolPtr(false),
+			IdempotentHint:  true,
+			OpenWorldHint:   boolPtr(false),
+		},
+	}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		_ = ctx
+		var input struct {
+			TransferID string `json:"transferId"`
+		}
+		if err := json.Unmarshal(req.Params.Arguments, &input); err != nil {
+			return transferErrorResult("InvalidRequest", "Invalid file_transfer_status arguments: "+err.Error()), nil
+		}
+		snapshot, err := devices.TransferStatus(input.TransferID)
+		if err != nil {
+			return transferErrorResult(transferErrorCode(err), err.Error()), nil
+		}
+		return transferSnapshotResult(snapshot, snapshot.Status == device.TransferFailed || snapshot.Status == device.TransferCancelled), nil
+	})
+
+	server.AddTool(&mcp.Tool{
+		Name:        "file_transfer_cancel",
+		Description: "Cancel an active cross-device file transfer. The receiving ShellCore removes its temporary .zshell-part file.",
+		InputSchema: objectSchema(map[string]any{
+			"transferId": stringProperty("Transfer ID returned by file_transfer."),
+		}, "transferId"),
+		OutputSchema: map[string]any{"type": "object", "additionalProperties": true},
+		Meta:         mcp.Meta{"securitySchemes": []any{map[string]any{"type": "oauth2", "scopes": []string{executeScope}}}},
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:    false,
+			DestructiveHint: boolPtr(false),
+			IdempotentHint:  true,
+			OpenWorldHint:   boolPtr(false),
+		},
+	}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		_ = ctx
+		var input struct {
+			TransferID string `json:"transferId"`
+		}
+		if err := json.Unmarshal(req.Params.Arguments, &input); err != nil {
+			return transferErrorResult("InvalidRequest", "Invalid file_transfer_cancel arguments: "+err.Error()), nil
+		}
+		snapshot, err := devices.CancelTransfer(input.TransferID)
+		if err != nil {
+			return transferErrorResult(transferErrorCode(err), err.Error()), nil
+		}
+		return transferSnapshotResult(snapshot, false), nil
+	})
+}
+
+func transferSnapshotResult(snapshot device.TransferSnapshot, isError bool) *mcp.CallToolResult {
+	encoded, _ := json.Marshal(snapshot)
+	var structured map[string]any
+	_ = json.Unmarshal(encoded, &structured)
+	text := fmt.Sprintf(
+		"transfer: %s\nstatus: %s\nsource: %s:%s\ntarget: %s:%s\nprogress: %.1f%% (%d/%d bytes)\nspeed: %.2f MiB/s",
+		snapshot.TransferID,
+		snapshot.Status,
+		snapshot.SourceDevice,
+		snapshot.SourcePath,
+		snapshot.TargetDevice,
+		snapshot.TargetPath,
+		snapshot.Progress,
+		snapshot.Transferred,
+		snapshot.Size,
+		snapshot.BytesPerSecond/(1024*1024),
+	)
+	if snapshot.SHA256 != "" {
+		text += "\nsha256: " + snapshot.SHA256
+	}
+	if snapshot.Error != "" {
+		text += "\nerror: " + snapshot.Error
+	}
+	result := &mcp.CallToolResult{StructuredContent: structured, IsError: isError}
+	result.Content = append(result.Content, &mcp.TextContent{Text: text})
+	return result
+}
+
+func transferErrorResult(code, message string) *mcp.CallToolResult {
+	result := &mcp.CallToolResult{
+		StructuredContent: map[string]any{"error": code, "message": message},
+		IsError:           true,
+	}
+	result.Content = append(result.Content, &mcp.TextContent{Text: message})
+	return result
+}
+
+func transferErrorCode(err error) string {
+	switch {
+	case errors.Is(err, device.ErrNoDevice):
+		return "NoDeviceConnected"
+	case errors.Is(err, device.ErrDeviceNotFound):
+		return "DeviceNotFound"
+	case errors.Is(err, device.ErrTransferNotFound):
+		return "TransferNotFound"
+	case errors.Is(err, device.ErrTransferDeviceBusy):
+		return "TransferDeviceBusy"
+	case errors.Is(err, device.ErrTransferSameDevice):
+		return "TransferSameDevice"
+	case errors.Is(err, device.ErrInvalidTransferRequest):
+		return "InvalidTransferRequest"
+	default:
+		return "TransferError"
 	}
 }
 

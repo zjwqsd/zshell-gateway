@@ -26,9 +26,15 @@ const (
 	heartbeatFailLimit = 3
 )
 
+type transportFrame struct {
+	Binary bool
+	Data   []byte
+}
+
 type messageTransport interface {
 	Send(any) error
-	Receive(any) error
+	SendBinary([]byte) error
+	ReceiveFrame() (transportFrame, error)
 	Close() error
 }
 
@@ -36,6 +42,10 @@ type Manager struct {
 	mu         sync.RWMutex
 	devices    map[string]*Device
 	nextCallID atomic.Uint64
+
+	transferMu     sync.RWMutex
+	transfers      map[string]*Transfer
+	activeTransfer map[string]string
 }
 
 // Device is the durable identity known to the Gateway. Its current WebSocket
@@ -85,7 +95,11 @@ type ConnectedDevice struct {
 }
 
 func NewManager() *Manager {
-	return &Manager{devices: make(map[string]*Device)}
+	return &Manager{
+		devices:        make(map[string]*Device),
+		transfers:      make(map[string]*Transfer),
+		activeTransfer: make(map[string]string),
+	}
 }
 
 func normalizeInfo(info Info) (Info, bool) {
@@ -286,9 +300,11 @@ func (m *Manager) Detach(session *Session) {
 	}
 	m.mu.Unlock()
 	session.close()
+	m.failTransfersForDevice(session.info.Name, "device disconnected")
 }
 
 func (m *Manager) Close() {
+	m.cancelAllTransfers("gateway shutting down")
 	m.mu.Lock()
 	sessions := make([]*Session, 0, len(m.devices))
 	for _, device := range m.devices {
@@ -334,22 +350,40 @@ func (s *Session) close() {
 
 func (s *Session) readLoop() error {
 	for {
-		var response wireResponse
-		if err := s.transport.Receive(&response); err != nil {
+		frame, err := s.transport.ReceiveFrame()
+		if err != nil {
 			return fmt.Errorf("%w: receive: %v", ErrTransportClosed, err)
 		}
-		if response.Type != "result" && response.Type != "pong" {
-			return fmt.Errorf("%w: unsupported response type %q", ErrTransportClosed, response.Type)
-		}
-
 		s.manager.touch(s)
-		pending := s.takePending(response.ID)
-		if pending == nil {
-			// Expected for a late response whose upstream MCP request was already
-			// cancelled or whose heartbeat timed out.
+
+		if frame.Binary {
+			if err := s.manager.handleTransferBinary(s, frame.Data); err != nil {
+				slog.Warn("transfer binary frame rejected", "device", s.info.Name, "error", err)
+			}
 			continue
 		}
-		pending.ch <- response
+
+		var response wireResponse
+		if err := json.Unmarshal(frame.Data, &response); err != nil {
+			return fmt.Errorf("%w: decode response: %v", ErrTransportClosed, err)
+		}
+
+		switch response.Type {
+		case "result", "pong":
+			pending := s.takePending(response.ID)
+			if pending == nil {
+				// Expected for a late response whose upstream MCP request was already
+				// cancelled or whose heartbeat timed out.
+				continue
+			}
+			pending.ch <- response
+		default:
+			if strings.HasPrefix(response.Type, "transfer_") {
+				s.manager.handleTransferMessage(s, response)
+				continue
+			}
+			return fmt.Errorf("%w: unsupported response type %q", ErrTransportClosed, response.Type)
+		}
 	}
 }
 
@@ -487,6 +521,21 @@ func (s *Session) send(value any) error {
 	}
 	if err := s.transport.Send(value); err != nil {
 		return fmt.Errorf("%w: send: %v", ErrTransportClosed, err)
+	}
+	return nil
+}
+
+func (s *Session) sendBinary(payload []byte) error {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+
+	select {
+	case <-s.done:
+		return ErrTransportClosed
+	default:
+	}
+	if err := s.transport.SendBinary(payload); err != nil {
+		return fmt.Errorf("%w: send binary: %v", ErrTransportClosed, err)
 	}
 	return nil
 }

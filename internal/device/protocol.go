@@ -2,7 +2,7 @@ package device
 
 import "encoding/json"
 
-const ProtocolVersion = 2
+const ProtocolVersion = 3
 
 type Info struct {
 	Name      string `json:"name"`
@@ -37,9 +37,14 @@ type pingMessage struct {
 }
 
 type wireResponse struct {
-	Type    string          `json:"type"`
-	ID      uint64          `json:"id"`
-	Payload json.RawMessage `json:"payload,omitempty"`
+	Type       string          `json:"type"`
+	ID         uint64          `json:"id,omitempty"`
+	Payload    json.RawMessage `json:"payload,omitempty"`
+	TransferID string          `json:"transferId,omitempty"`
+	Size       uint64          `json:"size,omitempty"`
+	SHA256     string          `json:"sha256,omitempty"`
+	Role       string          `json:"role,omitempty"`
+	Error      string          `json:"error,omitempty"`
 }
 
 type callEnvelope struct {

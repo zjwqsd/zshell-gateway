@@ -12,10 +12,11 @@ import (
 
 type fakeTransport struct{}
 
-func (*fakeTransport) Send(any) error              { return nil }
-func (*fakeTransport) Receive(any) error           { return nil }
-func (*fakeTransport) SetDeadline(time.Time) error { return nil }
-func (*fakeTransport) Close() error                { return nil }
+func (*fakeTransport) Send(any) error                        { return nil }
+func (*fakeTransport) SendBinary([]byte) error               { return nil }
+func (*fakeTransport) ReceiveFrame() (transportFrame, error) { return transportFrame{}, nil }
+func (*fakeTransport) SetDeadline(time.Time) error           { return nil }
+func (*fakeTransport) Close() error                          { return nil }
 
 func TestManagerMultipleDevicesAndDuplicateName(t *testing.T) {
 	manager := NewManager()
@@ -108,17 +109,26 @@ func (t *channelTransport) Send(value any) error {
 	}
 }
 
-func (t *channelTransport) Receive(value any) error {
+func (t *channelTransport) SendBinary(payload []byte) error {
+	copyPayload := append([]byte(nil), payload...)
 	select {
 	case <-t.closed:
 		return errors.New("transport closed")
-	case response := <-t.recv:
-		target, ok := value.(*wireResponse)
-		if !ok {
-			return fmt.Errorf("unexpected receive target %T", value)
-		}
-		*target = response
+	case t.sent <- copyPayload:
 		return nil
+	}
+}
+
+func (t *channelTransport) ReceiveFrame() (transportFrame, error) {
+	select {
+	case <-t.closed:
+		return transportFrame{}, errors.New("transport closed")
+	case response := <-t.recv:
+		data, err := json.Marshal(response)
+		if err != nil {
+			return transportFrame{}, err
+		}
+		return transportFrame{Data: data}, nil
 	}
 }
 
