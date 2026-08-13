@@ -17,6 +17,7 @@ const (
 	transferIDBytes          = 16
 	transferBinaryHeaderSize = len(transferBinaryMagic) + transferIDBytes + 8
 	maxTransferHistory       = 256
+	transferIdleTimeout      = 2 * time.Minute
 )
 
 var (
@@ -57,11 +58,13 @@ type Transfer struct {
 	sourceReady bool
 	targetReady bool
 	nextSeq     uint64
+	relayMu     sync.Mutex
 	createdAt   time.Time
 	startedAt   time.Time
 	updatedAt   time.Time
 	ready       chan struct{}
 	readyOnce   sync.Once
+	timer       *time.Timer
 }
 
 type TransferSnapshot struct {
@@ -164,7 +167,12 @@ func (m *Manager) StartTransfer(ctx context.Context, sourceDevice, sourcePath, t
 	m.transfers[id] = t
 	m.activeTransfer[sourceDevice] = id
 	m.activeTransfer[targetDevice] = id
+	t.timer = time.AfterFunc(transferIdleTimeout, func() {
+		m.expireTransfer(id)
+	})
 	m.transferMu.Unlock()
+
+	t.relayMu.Lock()
 
 	if err := target.send(transferTargetStartMessage{
 		Type:       "transfer_target_start",
@@ -172,14 +180,15 @@ func (m *Manager) StartTransfer(ctx context.Context, sourceDevice, sourcePath, t
 		Path:       targetPath,
 		Overwrite:  overwrite,
 	}); err != nil {
-		m.failTransfer(id, "failed to prepare target: "+err.Error())
+		m.failTransferRelayLocked(t, id, "failed to prepare target: "+err.Error())
 	} else if err := source.send(transferSourceStartMessage{
 		Type:       "transfer_source_start",
 		TransferID: id,
 		Path:       sourcePath,
 	}); err != nil {
-		m.failTransfer(id, "failed to prepare source: "+err.Error())
+		m.failTransferRelayLocked(t, id, "failed to prepare source: "+err.Error())
 	}
+	t.relayMu.Unlock()
 
 	select {
 	case <-t.ready:
@@ -205,9 +214,21 @@ func (m *Manager) TransferStatus(id string) (TransferSnapshot, error) {
 
 func (m *Manager) CancelTransfer(id string) (TransferSnapshot, error) {
 	id = strings.TrimSpace(id)
-	m.transferMu.Lock()
+	m.transferMu.RLock()
 	t := m.transfers[id]
 	if t == nil {
+		m.transferMu.RUnlock()
+		return TransferSnapshot{}, ErrTransferNotFound
+	}
+	m.transferMu.RUnlock()
+
+	// Relay and cancellation share this lock so a target can only observe
+	// either chunk-before-cancel or cancel-without-a-late-chunk.
+	t.relayMu.Lock()
+	defer t.relayMu.Unlock()
+
+	m.transferMu.Lock()
+	if m.transfers[id] != t {
 		m.transferMu.Unlock()
 		return TransferSnapshot{}, ErrTransferNotFound
 	}
@@ -261,9 +282,17 @@ func (m *Manager) handleTransferMessage(session *Session, response wireResponse)
 
 func (m *Manager) transferSourceReady(session *Session, id string, size uint64) {
 	var start *Session
-	m.transferMu.Lock()
+	m.transferMu.RLock()
 	t := m.transfers[id]
-	if t == nil || isFinalTransferState(t.State) || session != t.source || t.State != TransferPreparing {
+	m.transferMu.RUnlock()
+	if t == nil {
+		return
+	}
+	t.relayMu.Lock()
+	defer t.relayMu.Unlock()
+
+	m.transferMu.Lock()
+	if m.transfers[id] != t || isFinalTransferState(t.State) || session != t.source || t.State != TransferPreparing {
 		m.transferMu.Unlock()
 		return
 	}
@@ -282,16 +311,24 @@ func (m *Manager) transferSourceReady(session *Session, id string, size uint64) 
 
 	if start != nil {
 		if err := start.send(transferIDMessage{Type: "transfer_send", TransferID: id}); err != nil {
-			m.failTransfer(id, "failed to start source stream: "+err.Error())
+			m.failTransferRelayLocked(t, id, "failed to start source stream: "+err.Error())
 		}
 	}
 }
 
 func (m *Manager) transferTargetReady(session *Session, id string) {
 	var start *Session
-	m.transferMu.Lock()
+	m.transferMu.RLock()
 	t := m.transfers[id]
-	if t == nil || isFinalTransferState(t.State) || session != t.target || t.State != TransferPreparing {
+	m.transferMu.RUnlock()
+	if t == nil {
+		return
+	}
+	t.relayMu.Lock()
+	defer t.relayMu.Unlock()
+
+	m.transferMu.Lock()
+	if m.transfers[id] != t || isFinalTransferState(t.State) || session != t.target || t.State != TransferPreparing {
 		m.transferMu.Unlock()
 		return
 	}
@@ -309,7 +346,7 @@ func (m *Manager) transferTargetReady(session *Session, id string) {
 
 	if start != nil {
 		if err := start.send(transferIDMessage{Type: "transfer_send", TransferID: id}); err != nil {
-			m.failTransfer(id, "failed to start source stream: "+err.Error())
+			m.failTransferRelayLocked(t, id, "failed to start source stream: "+err.Error())
 		}
 	}
 }
@@ -323,24 +360,39 @@ func (m *Manager) handleTransferBinary(session *Session, frame []byte) error {
 	sequence := binary.BigEndian.Uint64(frame[sequenceOffset : sequenceOffset+8])
 	payloadBytes := uint64(len(frame) - transferBinaryHeaderSize)
 
-	m.transferMu.Lock()
+	m.transferMu.RLock()
 	t := m.transfers[id]
 	if t == nil {
-		m.transferMu.Unlock()
+		m.transferMu.RUnlock()
 		return ErrTransferNotFound
+	}
+	m.transferMu.RUnlock()
+
+	t.relayMu.Lock()
+	defer t.relayMu.Unlock()
+
+	m.transferMu.Lock()
+	if m.transfers[id] != t {
+		m.transferMu.Unlock()
+		return nil
+	}
+	if isFinalTransferState(t.State) {
+		m.transferMu.Unlock()
+		return nil
 	}
 	if t.State != TransferRunning || session != t.source {
 		m.transferMu.Unlock()
 		return fmt.Errorf("transfer %s is not accepting source chunks", id)
 	}
 	if sequence != t.nextSeq {
+		want := t.nextSeq
 		m.transferMu.Unlock()
-		m.failTransfer(id, fmt.Sprintf("chunk sequence mismatch: got %d want %d", sequence, t.nextSeq))
+		m.failTransferRelayLocked(t, id, fmt.Sprintf("chunk sequence mismatch: got %d want %d", sequence, want))
 		return errors.New("transfer chunk sequence mismatch")
 	}
 	if t.Transferred+payloadBytes > t.Size {
 		m.transferMu.Unlock()
-		m.failTransfer(id, "source sent more bytes than declared")
+		m.failTransferRelayLocked(t, id, "source sent more bytes than declared")
 		return errors.New("transfer size overflow")
 	}
 	target := t.target
@@ -350,13 +402,12 @@ func (m *Manager) handleTransferBinary(session *Session, frame []byte) error {
 	// apply backpressure all the way to the source without buffering the file in
 	// Gateway memory.
 	if err := target.sendBinary(frame); err != nil {
-		m.failTransfer(id, "target transport failed: "+err.Error())
+		m.failTransferRelayLocked(t, id, "target transport failed: "+err.Error())
 		return err
 	}
 
 	m.transferMu.Lock()
-	t = m.transfers[id]
-	if t != nil && t.State == TransferRunning && t.nextSeq == sequence {
+	if m.transfers[id] == t && t.State == TransferRunning && t.nextSeq == sequence {
 		t.nextSeq++
 		t.Transferred += payloadBytes
 		t.updatedAt = time.Now().UTC()
@@ -372,16 +423,25 @@ func (m *Manager) transferSourceFinish(session *Session, id string, size uint64,
 		return
 	}
 
+	m.transferMu.RLock()
+	t := m.transfers[id]
+	m.transferMu.RUnlock()
+	if t == nil {
+		return
+	}
+	t.relayMu.Lock()
+	defer t.relayMu.Unlock()
+
 	var target *Session
 	m.transferMu.Lock()
-	t := m.transfers[id]
-	if t == nil || isFinalTransferState(t.State) || session != t.source || t.State != TransferRunning {
+	if m.transfers[id] != t || isFinalTransferState(t.State) || session != t.source || t.State != TransferRunning {
 		m.transferMu.Unlock()
 		return
 	}
 	if size != t.Size || t.Transferred != t.Size {
+		message := fmt.Sprintf("source size mismatch: declared=%d relayed=%d expected=%d", size, t.Transferred, t.Size)
 		m.transferMu.Unlock()
-		m.failTransfer(id, fmt.Sprintf("source size mismatch: declared=%d relayed=%d expected=%d", size, t.Transferred, t.Size))
+		m.failTransferRelayLocked(t, id, message)
 		return
 	}
 	t.State = TransferVerifying
@@ -396,7 +456,7 @@ func (m *Manager) transferSourceFinish(session *Session, id string, size uint64,
 		Size:       size,
 		SHA256:     sha256,
 	}); err != nil {
-		m.failTransfer(id, "failed to commit target: "+err.Error())
+		m.failTransferRelayLocked(t, id, "failed to commit target: "+err.Error())
 	}
 }
 
@@ -456,9 +516,23 @@ func (m *Manager) transferSourceCancelled(session *Session, id string) {
 }
 
 func (m *Manager) failTransfer(id, message string) {
-	m.transferMu.Lock()
+	m.transferMu.RLock()
 	t := m.transfers[id]
-	if t == nil || isFinalTransferState(t.State) {
+	m.transferMu.RUnlock()
+	if t == nil {
+		return
+	}
+	t.relayMu.Lock()
+	defer t.relayMu.Unlock()
+	m.failTransferRelayLocked(t, id, message)
+}
+
+// failTransferRelayLocked finalizes a failure while the caller holds relayMu.
+// Keeping peer cancellation under the same lock prevents data frames from
+// being delivered after the target has processed transfer_cancel.
+func (m *Manager) failTransferRelayLocked(t *Transfer, id, message string) {
+	m.transferMu.Lock()
+	if m.transfers[id] != t || isFinalTransferState(t.State) {
 		m.transferMu.Unlock()
 		return
 	}
@@ -479,6 +553,36 @@ func (m *Manager) failTransfer(id, message string) {
 	if target != nil {
 		_ = target.send(cancel)
 	}
+}
+
+func (m *Manager) expireTransfer(id string) {
+	m.transferMu.RLock()
+	t := m.transfers[id]
+	m.transferMu.RUnlock()
+	if t == nil {
+		return
+	}
+
+	t.relayMu.Lock()
+	defer t.relayMu.Unlock()
+
+	m.transferMu.Lock()
+	if m.transfers[id] != t || isFinalTransferState(t.State) {
+		m.transferMu.Unlock()
+		return
+	}
+	idle := time.Since(t.updatedAt)
+	if idle < transferIdleTimeout {
+		remaining := transferIdleTimeout - idle
+		t.timer = time.AfterFunc(remaining, func() {
+			m.expireTransfer(id)
+		})
+		m.transferMu.Unlock()
+		return
+	}
+	m.transferMu.Unlock()
+
+	m.failTransferRelayLocked(t, id, "transfer timed out after 2 minutes without progress")
 }
 
 func (m *Manager) failTransfersForDevice(deviceName, reason string) {
@@ -533,6 +637,9 @@ func (m *Manager) pruneTransferHistoryLocked() {
 }
 
 func (m *Manager) releaseTransferDevicesLocked(t *Transfer) {
+	if t.timer != nil {
+		t.timer.Stop()
+	}
 	if m.activeTransfer[t.SourceDevice] == t.ID {
 		delete(m.activeTransfer, t.SourceDevice)
 	}

@@ -57,6 +57,8 @@ preparing -> transferring -> verifying -> completed
 
 The source computes SHA-256 while reading. The target independently hashes bytes written to `.zshell-part`. Gateway sends a commit only after every declared source byte has been relayed, and marks completion only after target size/hash matches the source.
 
+Chunk relay and terminal state changes are serialized per transfer, so cancellation cannot be followed by a late chunk at the target. Transfers with no preparation or data progress for two minutes fail automatically and release both device reservations.
+
 ## MCP routing
 
 `device_list` reads the live registry. Every Core-backed tool accepts an optional `device` selector:

@@ -269,3 +269,183 @@ func TestCancelTransferNotifiesBothPeersAndReleasesDevices(t *testing.T) {
 		t.Fatal("cancelled transfer did not release device reservations")
 	}
 }
+
+type blockingBinaryTransport struct {
+	*channelTransport
+	started chan struct{}
+	release chan struct{}
+}
+
+func newBlockingBinaryTransport() *blockingBinaryTransport {
+	return &blockingBinaryTransport{
+		channelTransport: newChannelTransport(),
+		started:          make(chan struct{}, 1),
+		release:          make(chan struct{}),
+	}
+}
+
+func (t *blockingBinaryTransport) SendBinary(payload []byte) error {
+	t.started <- struct{}{}
+	<-t.release
+	return t.channelTransport.SendBinary(payload)
+}
+
+func TestCancelWaitsForInFlightChunkBeforeNotifyingTarget(t *testing.T) {
+	manager := NewManager()
+	sourceTransport := newChannelTransport()
+	targetTransport := newBlockingBinaryTransport()
+	source, ok := manager.Attach(sourceTransport, Info{Name: "race-source"})
+	if !ok {
+		t.Fatal("attach source failed")
+	}
+	target, ok := manager.Attach(targetTransport, Info{Name: "race-target"})
+	if !ok {
+		t.Fatal("attach target failed")
+	}
+	sourceServe := make(chan error, 1)
+	targetServe := make(chan error, 1)
+	go func() { sourceServe <- manager.Serve(source) }()
+	go func() { targetServe <- manager.Serve(target) }()
+	defer func() {
+		manager.Detach(source)
+		manager.Detach(target)
+		<-sourceServe
+		<-targetServe
+	}()
+
+	started := make(chan TransferSnapshot, 1)
+	go func() {
+		snapshot, _ := manager.StartTransfer(context.Background(), "race-source", "a.bin", "race-target", "b.bin", false)
+		started <- snapshot
+	}()
+
+	targetStart := (<-targetTransport.sent).(transferTargetStartMessage)
+	<-sourceTransport.sent
+	targetTransport.recv <- wireResponse{Type: "transfer_target_ready", TransferID: targetStart.TransferID}
+	sourceTransport.recv <- wireResponse{Type: "transfer_source_ready", TransferID: targetStart.TransferID, Size: 5}
+	<-sourceTransport.sent
+	<-started
+
+	frameDone := make(chan error, 1)
+	go func() {
+		frameDone <- manager.handleTransferBinary(source, makeTransferTestFrame(t, targetStart.TransferID, 0, []byte("hello")))
+	}()
+	select {
+	case <-targetTransport.started:
+	case <-time.After(time.Second):
+		t.Fatal("binary relay did not enter target transport")
+	}
+
+	cancelDone := make(chan TransferSnapshot, 1)
+	go func() {
+		snapshot, _ := manager.CancelTransfer(targetStart.TransferID)
+		cancelDone <- snapshot
+	}()
+	select {
+	case <-cancelDone:
+		t.Fatal("cancel returned while a target chunk was still in flight")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(targetTransport.release)
+	if err := <-frameDone; err != nil {
+		t.Fatal(err)
+	}
+	cancelled := <-cancelDone
+	if cancelled.Status != TransferCancelled {
+		t.Fatalf("cancel status=%s", cancelled.Status)
+	}
+
+	first := <-targetTransport.sent
+	if _, ok := first.([]byte); !ok {
+		t.Fatalf("target first post-start message=%T, want binary frame", first)
+	}
+	second := <-targetTransport.sent
+	message, ok := second.(transferIDMessage)
+	if !ok || message.Type != "transfer_cancel" {
+		t.Fatalf("target second post-start message=%#v, want transfer_cancel", second)
+	}
+}
+
+func TestExpireTransferFailsIdleTransferAndReleasesDevices(t *testing.T) {
+	manager := NewManager()
+	source, ok := manager.Attach(&fakeTransport{}, Info{Name: "idle-source"})
+	if !ok {
+		t.Fatal("attach source failed")
+	}
+	target, ok := manager.Attach(&fakeTransport{}, Info{Name: "idle-target"})
+	if !ok {
+		t.Fatal("attach target failed")
+	}
+
+	id := "00112233445566778899aabbccddeeff"
+	stale := time.Now().UTC().Add(-transferIdleTimeout - time.Second)
+	transfer := &Transfer{
+		ID:           id,
+		SourceDevice: "idle-source",
+		TargetDevice: "idle-target",
+		source:       source,
+		target:       target,
+		State:        TransferRunning,
+		createdAt:    stale,
+		startedAt:    stale,
+		updatedAt:    stale,
+		ready:        make(chan struct{}),
+	}
+	manager.transferMu.Lock()
+	manager.transfers[id] = transfer
+	manager.activeTransfer[transfer.SourceDevice] = id
+	manager.activeTransfer[transfer.TargetDevice] = id
+	manager.transferMu.Unlock()
+
+	manager.expireTransfer(id)
+	snapshot, err := manager.TransferStatus(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Status != TransferFailed {
+		t.Fatalf("expired status=%s", snapshot.Status)
+	}
+	if snapshot.Error != "transfer timed out after 2 minutes without progress" {
+		t.Fatalf("expired error=%q", snapshot.Error)
+	}
+	manager.transferMu.RLock()
+	_, sourceBusy := manager.activeTransfer[transfer.SourceDevice]
+	_, targetBusy := manager.activeTransfer[transfer.TargetDevice]
+	manager.transferMu.RUnlock()
+	if sourceBusy || targetBusy {
+		t.Fatal("expired transfer did not release device reservations")
+	}
+}
+
+func TestLateSourceChunkAfterCancelIsIgnored(t *testing.T) {
+	manager := NewManager()
+	source, ok := manager.Attach(&fakeTransport{}, Info{Name: "late-source"})
+	if !ok {
+		t.Fatal("attach source failed")
+	}
+	_, ok = manager.Attach(&fakeTransport{}, Info{Name: "late-target"})
+	if !ok {
+		t.Fatal("attach target failed")
+	}
+
+	id := "00112233445566778899aabbccddeeff"
+	transfer := &Transfer{
+		ID:           id,
+		SourceDevice: "late-source",
+		TargetDevice: "late-target",
+		State:        TransferCancelled,
+		Size:         5,
+		createdAt:    time.Now().UTC(),
+		updatedAt:    time.Now().UTC(),
+		ready:        make(chan struct{}),
+	}
+	manager.transferMu.Lock()
+	manager.transfers[id] = transfer
+	manager.transferMu.Unlock()
+
+	frame := makeTransferTestFrame(t, id, 0, []byte("hello"))
+	if err := manager.handleTransferBinary(source, frame); err != nil {
+		t.Fatalf("late cancelled frame returned error: %v", err)
+	}
+}
