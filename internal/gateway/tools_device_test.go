@@ -119,3 +119,63 @@ func TestShellStartSchemaSupportsTerminalSelectionAndSizing(t *testing.T) {
 	}
 	t.Fatal("shell_start tool missing")
 }
+
+func TestFileEditingAndSearchToolSchemas(t *testing.T) {
+	found := map[string]toolSpec{}
+	for _, spec := range toolSpecs() {
+		if spec.Name == "file_search" || spec.Name == "file_patch" {
+			found[spec.Name] = spec
+		}
+	}
+
+	search, ok := found["file_search"]
+	if !ok {
+		t.Fatal("file_search tool missing")
+	}
+	if !search.ReadOnly {
+		t.Fatal("file_search must be read-only")
+	}
+	searchProps := search.InputSchema["properties"].(map[string]any)
+	for _, name := range []string{"path", "query", "glob", "maxResults"} {
+		if _, ok := searchProps[name]; !ok {
+			t.Fatalf("file_search schema missing %q", name)
+		}
+	}
+
+	patch, ok := found["file_patch"]
+	if !ok {
+		t.Fatal("file_patch tool missing")
+	}
+	if patch.ReadOnly {
+		t.Fatal("file_patch must be mutating")
+	}
+	patchProps := patch.InputSchema["properties"].(map[string]any)
+	for _, name := range []string{"path", "patch"} {
+		if _, ok := patchProps[name]; !ok {
+			t.Fatalf("file_patch schema missing %q", name)
+		}
+	}
+}
+
+func TestFormatFileSearchAndPatch(t *testing.T) {
+	searchText := formatToolText("file_search", map[string]any{
+		"path":      "src",
+		"query":     "needle",
+		"truncated": false,
+		"matches": []any{
+			map[string]any{"path": "src/a.zig", "line": 12.0, "column": 4.0, "text": "xxxneedle"},
+		},
+	})
+	if !strings.Contains(searchText, "src/a.zig:12:4: xxxneedle") {
+		t.Fatalf("unexpected file_search text: %q", searchText)
+	}
+
+	patchText := formatToolText("file_patch", map[string]any{
+		"path":         "src/a.zig",
+		"hunksApplied": 2.0,
+		"size":         123.0,
+	})
+	if patchText != "path: src/a.zig\nhunksApplied: 2\nsize: 123" {
+		t.Fatalf("unexpected file_patch text: %q", patchText)
+	}
+}

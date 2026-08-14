@@ -579,6 +579,18 @@ func formatToolText(name string, value map[string]any) string {
 			stringField(content, "encoding"),
 			stringField(content, "data"),
 		)
+	case "file_search":
+		matches, _ := value["matches"].([]any)
+		var b strings.Builder
+		fmt.Fprintf(&b, "path: %s\nquery: %s\ntruncated: %t\n",
+			stringField(value, "path"), stringField(value, "query"), boolField(value, "truncated"))
+		for _, raw := range matches {
+			match, _ := raw.(map[string]any)
+			fmt.Fprintf(&b, "%s:%0.f:%0.f: %s\n",
+				stringField(match, "path"), numberOrZero(match, "line"),
+				numberOrZero(match, "column"), stringField(match, "text"))
+		}
+		return b.String()
 	case "file_write":
 		return fmt.Sprintf(
 			"path: %s\nbytesWritten: %.0f\nsize: %.0f\nappended: %t",
@@ -586,6 +598,11 @@ func formatToolText(name string, value map[string]any) string {
 			numberOrZero(value, "bytesWritten"),
 			numberOrZero(value, "size"),
 			boolField(value, "appended"),
+		)
+	case "file_patch":
+		return fmt.Sprintf(
+			"path: %s\nhunksApplied: %.0f\nsize: %.0f",
+			stringField(value, "path"), numberOrZero(value, "hunksApplied"), numberOrZero(value, "size"),
 		)
 	case "file_mkdir":
 		return fmt.Sprintf("path: %s\nrecursive: %t", stringField(value, "path"), boolField(value, "recursive"))
@@ -985,6 +1002,23 @@ func toolSpecs() []toolSpec {
 			ReadOnly: true,
 		},
 		{
+			Name:        "file_search",
+			Description: "Recursively search UTF-8 text files for a literal string. Optionally filter file paths with a simple * and ? glob. Files larger than 4 MiB are skipped.",
+			InputSchema: objectSchema(map[string]any{
+				"path": pathProperty("Directory to search recursively. Defaults to the zshell workspace."),
+				"query": map[string]any{
+					"type": "string", "description": "Literal UTF-8 text to find.", "minLength": 1,
+				},
+				"glob": map[string]any{
+					"type": "string", "description": "Optional simple glob using * and ?. A pattern without path separators matches basenames.", "minLength": 1,
+				},
+				"maxResults": map[string]any{
+					"type": "integer", "description": "Maximum matching lines to return. Defaults to 100.", "minimum": 1, "maximum": 1000,
+				},
+			}, "query"),
+			ReadOnly: true,
+		},
+		{
 			Name:        "file_write",
 			Description: "Write or append data to a file. Data may be UTF-8 text or base64-encoded binary, with a decoded limit of 4 MiB per call.",
 			InputSchema: objectSchema(map[string]any{
@@ -999,6 +1033,16 @@ func toolSpecs() []toolSpec {
 					"type": "boolean", "description": "Append instead of replacing the file. Defaults to false.",
 				},
 			}, "path", "data"),
+		},
+		{
+			Name:        "file_patch",
+			Description: "Apply a unified diff to one existing UTF-8 text file. Every hunk is context-checked and the operation fails if the current file does not match the patch.",
+			InputSchema: objectSchema(map[string]any{
+				"path": pathProperty("Existing text file to modify."),
+				"patch": map[string]any{
+					"type": "string", "description": "Unified diff containing one or more @@ hunks. ---/+++ headers are optional.", "minLength": 1,
+				},
+			}, "path", "patch"),
 		},
 		{
 			Name:        "file_mkdir",
