@@ -358,7 +358,11 @@ func (m *Manager) handleTransferBinary(session *Session, frame []byte) error {
 	id := hex.EncodeToString(frame[len(transferBinaryMagic) : len(transferBinaryMagic)+transferIDBytes])
 	sequenceOffset := len(transferBinaryMagic) + transferIDBytes
 	sequence := binary.BigEndian.Uint64(frame[sequenceOffset : sequenceOffset+8])
-	payloadBytes := uint64(len(frame) - transferBinaryHeaderSize)
+	return m.handleTransferChunk(session, id, sequence, frame[transferBinaryHeaderSize:])
+}
+
+func (m *Manager) handleTransferChunk(session *Session, id string, sequence uint64, payload []byte) error {
+	payloadBytes := uint64(len(payload))
 
 	m.transferMu.RLock()
 	t := m.transfers[id]
@@ -398,10 +402,10 @@ func (m *Manager) handleTransferBinary(session *Session, frame []byte) error {
 	target := t.target
 	m.transferMu.Unlock()
 
-	// This synchronous write is intentional: the target WebSocket and disk path
-	// apply backpressure all the way to the source without buffering the file in
-	// Gateway memory.
-	if err := target.sendBinary(frame); err != nil {
+	// The target transport owns its wire representation. WebSocket encodes the
+	// existing ZTF1 binary frame; HTTP streams raw application/octet-stream.
+	// The synchronous call preserves backpressure through Gateway.
+	if err := target.sendTransferChunk(id, sequence, payload); err != nil {
 		m.failTransferRelayLocked(t, id, "target transport failed: "+err.Error())
 		return err
 	}
@@ -696,6 +700,20 @@ func newTransferID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(id[:]), nil
+}
+
+func encodeTransferFrame(id string, sequence uint64, payload []byte) ([]byte, error) {
+	rawID, err := hex.DecodeString(id)
+	if err != nil || len(rawID) != transferIDBytes {
+		return nil, ErrInvalidTransferRequest
+	}
+	frame := make([]byte, transferBinaryHeaderSize+len(payload))
+	copy(frame[:len(transferBinaryMagic)], transferBinaryMagic)
+	copy(frame[len(transferBinaryMagic):len(transferBinaryMagic)+transferIDBytes], rawID)
+	sequenceOffset := len(transferBinaryMagic) + transferIDBytes
+	binary.BigEndian.PutUint64(frame[sequenceOffset:sequenceOffset+8], sequence)
+	copy(frame[transferBinaryHeaderSize:], payload)
+	return frame, nil
 }
 
 func validSHA256(value string) bool {

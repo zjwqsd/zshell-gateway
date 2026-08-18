@@ -12,11 +12,12 @@ import (
 
 type fakeTransport struct{}
 
-func (*fakeTransport) Send(any) error                        { return nil }
-func (*fakeTransport) SendBinary([]byte) error               { return nil }
-func (*fakeTransport) ReceiveFrame() (transportFrame, error) { return transportFrame{}, nil }
-func (*fakeTransport) SetDeadline(time.Time) error           { return nil }
-func (*fakeTransport) Close() error                          { return nil }
+func (*fakeTransport) Name() string                                   { return "websocket" }
+func (*fakeTransport) Send(any) error                                 { return nil }
+func (*fakeTransport) SendTransferChunk(string, uint64, []byte) error { return nil }
+func (*fakeTransport) ReceiveFrame() (transportFrame, error)          { return transportFrame{}, nil }
+func (*fakeTransport) SetDeadline(time.Time) error                    { return nil }
+func (*fakeTransport) Close() error                                   { return nil }
 
 func TestManagerMultipleDevicesAndDuplicateName(t *testing.T) {
 	manager := NewManager()
@@ -100,6 +101,8 @@ func newChannelTransport() *channelTransport {
 	}
 }
 
+func (t *channelTransport) Name() string { return "websocket" }
+
 func (t *channelTransport) Send(value any) error {
 	select {
 	case <-t.closed:
@@ -109,8 +112,12 @@ func (t *channelTransport) Send(value any) error {
 	}
 }
 
-func (t *channelTransport) SendBinary(payload []byte) error {
-	copyPayload := append([]byte(nil), payload...)
+func (t *channelTransport) SendTransferChunk(transferID string, sequence uint64, payload []byte) error {
+	frame, err := encodeTransferFrame(transferID, sequence, payload)
+	if err != nil {
+		return err
+	}
+	copyPayload := append([]byte(nil), frame...)
 	select {
 	case <-t.closed:
 		return errors.New("transport closed")

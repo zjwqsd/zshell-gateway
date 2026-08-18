@@ -284,10 +284,10 @@ func newBlockingBinaryTransport() *blockingBinaryTransport {
 	}
 }
 
-func (t *blockingBinaryTransport) SendBinary(payload []byte) error {
+func (t *blockingBinaryTransport) SendTransferChunk(transferID string, sequence uint64, payload []byte) error {
 	t.started <- struct{}{}
 	<-t.release
-	return t.channelTransport.SendBinary(payload)
+	return t.channelTransport.SendTransferChunk(transferID, sequence, payload)
 }
 
 func TestCancelWaitsForInFlightChunkBeforeNotifyingTarget(t *testing.T) {

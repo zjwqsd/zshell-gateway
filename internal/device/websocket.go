@@ -20,12 +20,18 @@ type webSocketTransport struct {
 	conn *websocket.Conn
 }
 
+func (t *webSocketTransport) Name() string { return "websocket" }
+
 func (t *webSocketTransport) Send(value any) error {
 	return websocket.JSON.Send(t.conn, value)
 }
 
-func (t *webSocketTransport) SendBinary(payload []byte) error {
-	return websocket.Message.Send(t.conn, payload)
+func (t *webSocketTransport) SendTransferChunk(transferID string, sequence uint64, payload []byte) error {
+	frame, err := encodeTransferFrame(transferID, sequence, payload)
+	if err != nil {
+		return err
+	}
+	return websocket.Message.Send(t.conn, frame)
 }
 
 var receiveFrameCodec = websocket.Codec{

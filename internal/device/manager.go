@@ -32,8 +32,9 @@ type transportFrame struct {
 }
 
 type messageTransport interface {
+	Name() string
 	Send(any) error
-	SendBinary([]byte) error
+	SendTransferChunk(string, uint64, []byte) error
 	ReceiveFrame() (transportFrame, error)
 	Close() error
 }
@@ -48,7 +49,7 @@ type Manager struct {
 	activeTransfer map[string]string
 }
 
-// Device is the durable identity known to the Gateway. Its current WebSocket
+// Device is the durable identity known to the Gateway. Its current transport
 // session is replaceable: losing a transport marks the device offline without
 // conflating the device identity with that particular socket.
 type Device struct {
@@ -156,7 +157,7 @@ func (m *Manager) List() []ConnectedDevice {
 		if device.session == nil {
 			continue
 		}
-		devices = append(devices, connectedDevice(device.info))
+		devices = append(devices, connectedDevice(device.info, device.session.transport.Name()))
 	}
 	m.mu.RUnlock()
 
@@ -166,14 +167,14 @@ func (m *Manager) List() []ConnectedDevice {
 	return devices
 }
 
-func connectedDevice(info Info) ConnectedDevice {
+func connectedDevice(info Info, transport string) ConnectedDevice {
 	return ConnectedDevice{
 		Name:      info.Name,
 		Workspace: info.Workspace,
 		OS:        info.OS,
 		Arch:      info.Arch,
 		Version:   info.Version,
-		Transport: "websocket",
+		Transport: transport,
 	}
 }
 
@@ -525,7 +526,7 @@ func (s *Session) send(value any) error {
 	return nil
 }
 
-func (s *Session) sendBinary(payload []byte) error {
+func (s *Session) sendTransferChunk(transferID string, sequence uint64, payload []byte) error {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
 
@@ -534,8 +535,8 @@ func (s *Session) sendBinary(payload []byte) error {
 		return ErrTransportClosed
 	default:
 	}
-	if err := s.transport.SendBinary(payload); err != nil {
-		return fmt.Errorf("%w: send binary: %v", ErrTransportClosed, err)
+	if err := s.transport.SendTransferChunk(transferID, sequence, payload); err != nil {
+		return fmt.Errorf("%w: send transfer chunk: %v", ErrTransportClosed, err)
 	}
 	return nil
 }

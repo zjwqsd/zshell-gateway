@@ -11,6 +11,7 @@ The gateway exposes one HTTP service. MCP, OAuth, health checks and ShellCore de
 /oauth/*      OAuth authorization endpoints
 /.well-known/* OAuth/MCP metadata
 /device/ws    ShellCore WebSocket transport
+/device/http  ShellCore HTTP transport
 /healthz      process health
 ```
 
@@ -24,22 +25,24 @@ There is no separate ShellCore TCP listener.
 
 ## ShellCore transport
 
-ShellCore connects outbound to `/device/ws` and authenticates the WebSocket upgrade with:
+Gateway accepts both `/device/ws` and `/device/http`. Both authenticate with:
 
 ```text
 Authorization: Bearer <ZSHELL_DEVICE_TOKEN>
 ```
 
-After the upgrade, the same WebSocket carries the protocol-v3 device hello, calls, results, liveness messages and cross-device transfer traffic. Device names are supplied by ShellCore and must be unique while connected.
+The Core selects transport from `ZSHELL_GATEWAY_URL`: `ws://`/`wss://` use WebSocket and `http://`/`https://` use HTTP. There is no automatic fallback. Device names are supplied by ShellCore and must be unique while connected.
 
-Recommended URLs:
+WebSocket keeps the existing protocol-v3 wire format. HTTP creates a device session, uses long polling for Gateway-to-Core control messages, POST requests for Core-to-Gateway control messages, and separate raw binary endpoints for file chunks.
+
+Recommended public URLs:
 
 ```text
-Public: wss://zshell.example.com/device/ws
-LAN:    ws://192.168.1.20:8765/device/ws
+WebSocket: wss://zshell.example.com/device/ws
+HTTP:      https://zshell.example.com/device/http
 ```
 
-Use `wss://` for any untrusted network. `ws://` is intended only for trusted LAN use because its traffic and device token are not encrypted.
+Use TLS (`wss://` or `https://`) on untrusted networks.
 
 ## Required environment
 
@@ -76,6 +79,7 @@ Then both clients use the same hostname:
 ```text
 ChatGPT -> https://zshell.example.com/mcp
 Core    -> wss://zshell.example.com/device/ws
+       or https://zshell.example.com/device/http
 ```
 
 No additional public device port is required.
@@ -90,13 +94,15 @@ file_transfer_status
 file_transfer_cancel
 ```
 
-`file_transfer` names both source and target devices explicitly. Gateway asks both Cores to prepare their local paths, then streams 256 KiB file chunks as raw WebSocket binary frames:
+`file_transfer` names both source and target devices explicitly. Gateway asks both Cores to prepare their local paths and relays chunks through the transport of each peer:
 
 ```text
 source Core -> Gateway -> target Core
 ```
 
-Gateway does not load the whole file into memory, persist it to disk, base64-encode it, or place file bytes in MCP responses. The synchronous target WebSocket write provides backpressure to the source. Control messages remain JSON/text frames.
+All combinations are supported: WebSocket -> WebSocket, WebSocket -> HTTP, HTTP -> WebSocket, and HTTP -> HTTP. WebSocket keeps the existing 256 KiB `ZTF1` binary frames. HTTP file data uses raw `application/octet-stream` requests (currently 1 MiB chunks) with explicit sequence/ack handling.
+
+Gateway does not load the whole file into memory, persist it to disk, base64-encode it, or place file bytes in MCP responses. Transport writes/acknowledgements provide backpressure to the source. Control messages remain protocol-v3 JSON messages.
 
 The target writes to `<destination>.zshell-part`. Completion requires matching byte counts and SHA-256 digests from source and target before the target file is committed. Cancellation/failure removes the temporary file. In protocol v3, one device can participate in at most one active transfer at a time.
 
@@ -123,9 +129,9 @@ go build ./cmd/zshell-gateway
 ## Security notes
 
 - Keep `ZSHELL_DEVICE_TOKEN` high-entropy and out of logs/source control.
-- Public ShellCore connections must use `wss://` so TLS protects the token and device traffic.
-- WebSocket messages are capped at 8 MiB.
+- Public ShellCore connections must use `wss://` or `https://` so TLS protects the token and device traffic.
+- WebSocket messages are capped at 8 MiB; HTTP control bodies and transfer chunks are independently bounded.
 - The HTTP server applies header/read timeouts; the device registry rejects duplicate live names.
 - OAuth dynamic client registrations are persisted across Gateway restarts. Only client metadata is stored; access tokens, Admin PINs and authorization codes are not written to this file.
 - OAuth redirect URIs must use HTTPS, except loopback HTTP callbacks. Authorization still requires an exact match to the registered redirect URI.
-- Stopping a Core closes its WebSocket and removes the device from the live registry.
+- Stopping a Core closes its active transport session and removes the device from the live registry.

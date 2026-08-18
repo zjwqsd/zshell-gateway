@@ -31,7 +31,7 @@ func NewServer(cfg Config) (*Server, error) {
 		Name:    "zshell",
 		Version: "0.2.0",
 	}, &mcp.ServerOptions{
-		Instructions: "Provides terminal, filesystem, process, browser, and direct cross-device file-transfer control through connected ShellCore devices over WebSocket. Device names are declared by each ShellCore and update dynamically as devices connect or disconnect. Call device_list to inspect current devices and workspaces. When multiple devices are online, select one explicitly with the device argument. For browser work, call browser_status first; enabled=false means that ShellCore was started without browser capability and browser tools other than status will return BrowserFeatureDisabled. When enabled, call browser_start when no session is active, and browser_snapshot to obtain current element refs before ref-based actions. Browser ownership may be transferred to the human only for a visible session; after ownership returns to the agent, take a fresh browser_snapshot before reusing refs. For cross-device files, use file_transfer with explicit sourceDevice/sourcePath and targetDevice/targetPath, then file_transfer_status or file_transfer_cancel. File bytes stream through Gateway binary frames rather than MCP content. Local human control on each ShellCore may block new mutating actions or terminate active work.",
+		Instructions: "Provides terminal, filesystem, process, browser, and direct cross-device file-transfer control through connected ShellCore devices over WebSocket or HTTP transport. Device names are declared by each ShellCore and update dynamically as devices connect or disconnect. Call device_list to inspect current devices and workspaces. When multiple devices are online, select one explicitly with the device argument. For browser work, call browser_status first; enabled=false means that ShellCore was started without browser capability and browser tools other than status will return BrowserFeatureDisabled. When enabled, call browser_start when no session is active, and browser_snapshot to obtain current element refs before ref-based actions. Browser ownership may be transferred to the human only for a visible session; after ownership returns to the agent, take a fresh browser_snapshot before reusing refs. For cross-device files, use file_transfer with explicit sourceDevice/sourcePath and targetDevice/targetPath, then file_transfer_status or file_transfer_cancel. File bytes stream directly through Gateway transport endpoints rather than MCP content. Local human control on each ShellCore may block new mutating actions or terminate active work.",
 	})
 	RegisterTools(mcpServer, devices)
 
@@ -57,6 +57,9 @@ func NewServer(cfg Config) (*Server, error) {
 
 	mux := http.NewServeMux()
 	mux.Handle("/device/ws", device.NewWebSocketHandler(cfg.DeviceToken, devices))
+	httpDeviceHandler := device.NewHTTPHandler(cfg.DeviceToken, devices)
+	mux.Handle("/device/http", httpDeviceHandler)
+	mux.Handle("/device/http/", httpDeviceHandler)
 	mux.Handle("/mcp", logRequest("mcp", authedMCP))
 	mux.HandleFunc("/.well-known/oauth-protected-resource", oauthProvider.HandleProtectedResource)
 	mux.HandleFunc("/.well-known/oauth-protected-resource/mcp", oauthProvider.HandleProtectedResource)
@@ -95,6 +98,7 @@ func (s *Server) ListenAndServe() error {
 	slog.Info("zshell public base", "url", s.cfg.PublicBase)
 	slog.Info("zshell OAuth client registry", "file", s.cfg.OAuthClientsFile)
 	slog.Info("zshell ShellCore WebSocket endpoint", "path", "/device/ws")
+	slog.Info("zshell ShellCore HTTP endpoint", "path", "/device/http")
 	return s.httpServer.ListenAndServe()
 }
 
