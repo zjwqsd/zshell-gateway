@@ -14,7 +14,6 @@ import (
 
 type toolSpec struct {
 	Name        string
-	Operation   string
 	Description string
 	InputSchema map[string]any
 	ReadOnly    bool
@@ -57,12 +56,6 @@ func registerTransferTools(server *mcp.Server, devices *device.Manager) {
 		}
 		if err := json.Unmarshal(req.Params.Arguments, &input); err != nil {
 			return transferErrorResult("InvalidRequest", "Invalid file_transfer arguments: "+err.Error()), nil
-		}
-		if err := devices.RequireCapability(input.SourceDevice, "files.transfer"); err != nil {
-			return transferCapabilityError(err, input.SourceDevice, devices.List()), nil
-		}
-		if err := devices.RequireCapability(input.TargetDevice, "files.transfer"); err != nil {
-			return transferCapabilityError(err, input.TargetDevice, devices.List()), nil
 		}
 		snapshot, err := devices.StartTransfer(ctx, input.SourceDevice, input.SourcePath, input.TargetDevice, input.TargetPath, input.Overwrite)
 		if err != nil {
@@ -167,60 +160,6 @@ func transferErrorResult(code, message string) *mcp.CallToolResult {
 	return result
 }
 
-func transferCapabilityError(err error, deviceName string, connected []device.ConnectedDevice) *mcp.CallToolResult {
-	switch {
-	case errors.Is(err, device.ErrDeviceNotFound):
-		return routingErrorResult("DeviceNotFound", fmt.Sprintf("The transfer device %q is not connected.", deviceName), connected)
-	case errors.Is(err, device.ErrCapabilityUnsupported):
-		return routingErrorResult("CapabilityUnsupported", fmt.Sprintf("The transfer device %q does not support direct file transfer.", deviceName), connected)
-	default:
-		return transferErrorResult("TransferError", err.Error())
-	}
-}
-
-func requiredCapability(toolName string) string {
-	switch toolName {
-	case "environment_info", "control_status":
-		return ""
-	case "exec":
-		return "core.exec"
-	case "device_info":
-		return "device.info"
-	case "app_list", "app_info":
-		return "apps.read"
-	case "app_launch":
-		return "apps.launch"
-	case "app_stop":
-		return "apps.stop"
-	case "app_current":
-		return "apps.current"
-	case "screen_capture":
-		return "screen.capture"
-	case "ui_dump":
-		return "ui.inspect"
-	case "ui_tap", "ui_swipe", "ui_text", "ui_keyevent":
-		return "ui.input"
-	case "android_intent_start":
-		return "android.intent"
-	}
-	if strings.HasPrefix(toolName, "job_") {
-		return "core.jobs"
-	}
-	if strings.HasPrefix(toolName, "shell_") {
-		return "core.shell"
-	}
-	if strings.HasPrefix(toolName, "browser_") {
-		return "browser"
-	}
-	switch toolName {
-	case "file_stat", "file_list", "file_read", "file_search":
-		return "files.read"
-	case "file_write", "file_patch", "file_mkdir":
-		return "files.write"
-	}
-	return ""
-}
-
 func transferErrorCode(err error) string {
 	switch {
 	case errors.Is(err, device.ErrNoDevice):
@@ -273,27 +212,7 @@ func registerDeviceTool(server *mcp.Server, devices *device.Manager, spec toolSp
 			return nil, err
 		}
 
-		capability := requiredCapability(spec.Name)
-		if err := devices.RequireCapability(deviceName, capability); err != nil {
-			switch {
-			case errors.Is(err, device.ErrNoDevice):
-				return routingErrorResult("NoDeviceConnected", "No ShellCore device is connected.", devices.List()), nil
-			case errors.Is(err, device.ErrDeviceRequired):
-				return routingErrorResult("DeviceRequired", "Multiple ShellCore devices are connected. Call device_list and pass device explicitly.", devices.List()), nil
-			case errors.Is(err, device.ErrDeviceNotFound):
-				return routingErrorResult("DeviceNotFound", "The requested ShellCore device is not connected. Call device_list for current devices.", devices.List()), nil
-			case errors.Is(err, device.ErrCapabilityUnsupported):
-				return routingErrorResult("CapabilityUnsupported", fmt.Sprintf("The selected ShellCore does not provide capability %q required by %s.", capability, spec.Name), devices.List()), nil
-			default:
-				return nil, err
-			}
-		}
-
-		operation := spec.Operation
-		if operation == "" {
-			operation = spec.Name
-		}
-		result, failure, err := devices.Call(ctx, deviceName, operation, arguments)
+		result, failure, err := devices.Call(ctx, deviceName, spec.Name, arguments)
 		if err != nil {
 			switch {
 			case errors.Is(err, device.ErrNoDevice):
@@ -326,7 +245,7 @@ func registerDeviceTool(server *mcp.Server, devices *device.Manager, spec toolSp
 func registerDeviceList(server *mcp.Server, devices *device.Manager) {
 	server.AddTool(&mcp.Tool{
 		Name:        "device_list",
-		Description: "List all currently connected ShellCore devices, workspaces, platforms, and effective capabilities. Use the returned name as the device selector for other tools.",
+		Description: "List all currently connected ShellCore devices and their workspaces. Use the returned name as the device selector for other tools.",
 		InputSchema: objectSchema(map[string]any{}),
 		OutputSchema: map[string]any{
 			"type":                 "object",
@@ -434,9 +353,6 @@ func formatDeviceListText(devices []device.ConnectedDevice) string {
 		}
 		if item.Version != "" {
 			fmt.Fprintf(&b, " | core: %s", item.Version)
-		}
-		if len(item.Capabilities) > 0 {
-			fmt.Fprintf(&b, " | capabilities: %s", strings.Join(item.Capabilities, ", "))
 		}
 		b.WriteByte('\n')
 	}
@@ -1137,111 +1053,6 @@ func toolSpecs() []toolSpec {
 					"type": "boolean", "description": "Create missing parent directories. Defaults to true.",
 				},
 			}, "path"),
-		},
-		{
-			Name:        "device_info",
-			Description: "Return structured device and operating-system information. Fields are platform-specific but include stable identity, OS, architecture, and available display/power details where supported.",
-			InputSchema: empty(),
-			ReadOnly:    true,
-		},
-		{
-			Name:        "app_list",
-			Description: "List applications known to the selected device. Application identifiers are platform-native (Android package names, Linux desktop IDs, or Windows application IDs).",
-			InputSchema: objectSchema(map[string]any{
-				"filter":   map[string]any{"type": "string", "description": "Optional case-insensitive substring filter."},
-				"userOnly": boolProperty("Return user-installed applications only when the platform can distinguish them. Defaults to false."),
-			}),
-			ReadOnly: true,
-		},
-		{
-			Name:        "app_info",
-			Description: "Return metadata for one platform-native application identifier.",
-			InputSchema: objectSchema(map[string]any{
-				"app": stringProperty("Platform-native application identifier."),
-			}, "app"),
-			ReadOnly: true,
-		},
-		{
-			Name:        "app_launch",
-			Description: "Launch an application by its platform-native application identifier without navigating the graphical launcher.",
-			InputSchema: objectSchema(map[string]any{
-				"app": stringProperty("Platform-native application identifier."),
-			}, "app"),
-		},
-		{
-			Name:        "app_stop",
-			Description: "Stop or terminate an application by its platform-native application identifier.",
-			InputSchema: objectSchema(map[string]any{
-				"app": stringProperty("Platform-native application identifier."),
-			}, "app"),
-		},
-		{
-			Name:        "app_current",
-			Description: "Return the currently focused or foreground application when the platform exposes one.",
-			InputSchema: empty(),
-			ReadOnly:    true,
-		},
-		{
-			Name:        "screen_capture",
-			Description: "Capture the current device screen to a file. Set includeData=true only when inline image bytes are required.",
-			InputSchema: objectSchema(map[string]any{
-				"path":        pathProperty("Optional output path on the selected device."),
-				"includeData": boolProperty("Include the captured PNG as base64 in the result. Defaults to false."),
-			}),
-		},
-		{
-			Name:        "ui_dump",
-			Description: "Return the current native UI hierarchy when the selected platform provides a semantic UI inspection backend.",
-			InputSchema: empty(),
-			ReadOnly:    true,
-		},
-		{
-			Name:        "ui_tap",
-			Description: "Inject a pointer tap in screen pixel coordinates.",
-			InputSchema: objectSchema(map[string]any{
-				"x": nonNegativeIntegerProperty("Screen X coordinate in pixels.", 2147483647),
-				"y": nonNegativeIntegerProperty("Screen Y coordinate in pixels.", 2147483647),
-			}, "x", "y"),
-		},
-		{
-			Name:        "ui_swipe",
-			Description: "Inject a pointer swipe between two screen pixel coordinates.",
-			InputSchema: objectSchema(map[string]any{
-				"x1":         nonNegativeIntegerProperty("Start X coordinate in pixels.", 2147483647),
-				"y1":         nonNegativeIntegerProperty("Start Y coordinate in pixels.", 2147483647),
-				"x2":         nonNegativeIntegerProperty("End X coordinate in pixels.", 2147483647),
-				"y2":         nonNegativeIntegerProperty("End Y coordinate in pixels.", 2147483647),
-				"durationMs": map[string]any{"type": "integer", "description": "Gesture duration in milliseconds. Defaults to 300.", "minimum": 1, "maximum": 60000},
-			}, "x1", "y1", "x2", "y2"),
-		},
-		{
-			Name:        "ui_text",
-			Description: "Inject text into the currently focused native UI element.",
-			InputSchema: objectSchema(map[string]any{
-				"text": map[string]any{"type": "string", "description": "Text to inject."},
-			}, "text"),
-		},
-		{
-			Name:        "ui_keyevent",
-			Description: "Inject a platform-native key event name or numeric key code.",
-			InputSchema: objectSchema(map[string]any{
-				"key": map[string]any{"description": "Platform-native key name or integer key code.", "anyOf": []any{map[string]any{"type": "string"}, map[string]any{"type": "integer"}}},
-			}, "key"),
-		},
-		{
-			Name:        "android_intent_start",
-			Operation:   "intent_start",
-			Description: "Start an Android Intent using the Android ShellCore app process. This is Android-specific and can open content URIs or activities that adb shell itself cannot directly grant.",
-			InputSchema: objectSchema(map[string]any{
-				"action":     stringProperty("Intent action. Defaults to android.intent.action.VIEW."),
-				"data":       stringProperty("Optional data URI."),
-				"type":       stringProperty("Optional MIME type."),
-				"package":    stringProperty("Optional target package name."),
-				"component":  stringProperty("Optional flattened package/class component."),
-				"categories": stringArrayProperty("Optional intent categories."),
-				"extras":     map[string]any{"type": "object", "description": "Optional scalar intent extras.", "additionalProperties": true},
-				"flags":      map[string]any{"type": "integer", "description": "Optional Android Intent flags bitmask."},
-			}),
 		},
 		{
 			Name:        "browser_status",

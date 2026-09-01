@@ -14,11 +14,10 @@ import (
 )
 
 var (
-	ErrNoDevice              = errors.New("no device connected")
-	ErrDeviceRequired        = errors.New("multiple devices connected; device is required")
-	ErrDeviceNotFound        = errors.New("device not found")
-	ErrTransportClosed       = errors.New("device transport closed")
-	ErrCapabilityUnsupported = errors.New("device capability unsupported")
+	ErrNoDevice        = errors.New("no device connected")
+	ErrDeviceRequired  = errors.New("multiple devices connected; device is required")
+	ErrDeviceNotFound  = errors.New("device not found")
+	ErrTransportClosed = errors.New("device transport closed")
 )
 
 const (
@@ -88,13 +87,12 @@ type Session struct {
 }
 
 type ConnectedDevice struct {
-	Name         string   `json:"name"`
-	Workspace    string   `json:"workspace,omitempty"`
-	OS           string   `json:"os"`
-	Arch         string   `json:"arch"`
-	Version      string   `json:"version"`
-	Transport    string   `json:"transport"`
-	Capabilities []string `json:"capabilities"`
+	Name      string `json:"name"`
+	Workspace string `json:"workspace,omitempty"`
+	OS        string `json:"os"`
+	Arch      string `json:"arch"`
+	Version   string `json:"version"`
+	Transport string `json:"transport"`
 }
 
 func NewManager() *Manager {
@@ -111,24 +109,6 @@ func normalizeInfo(info Info) (Info, bool) {
 	info.OS = strings.TrimSpace(info.OS)
 	info.Arch = strings.TrimSpace(info.Arch)
 	info.Version = strings.TrimSpace(info.Version)
-	if len(info.Capabilities) > 128 {
-		return Info{}, false
-	}
-	seenCaps := make(map[string]struct{}, len(info.Capabilities))
-	caps := make([]string, 0, len(info.Capabilities))
-	for _, raw := range info.Capabilities {
-		capability := strings.TrimSpace(raw)
-		if capability == "" || len(capability) > 64 {
-			return Info{}, false
-		}
-		if _, exists := seenCaps[capability]; exists {
-			continue
-		}
-		seenCaps[capability] = struct{}{}
-		caps = append(caps, capability)
-	}
-	sort.Strings(caps)
-	info.Capabilities = caps
 	if info.Name == "" || len(info.Name) > 128 {
 		return Info{}, false
 	}
@@ -189,57 +169,13 @@ func (m *Manager) List() []ConnectedDevice {
 
 func connectedDevice(info Info, transport string) ConnectedDevice {
 	return ConnectedDevice{
-		Name:         info.Name,
-		Workspace:    info.Workspace,
-		OS:           info.OS,
-		Arch:         info.Arch,
-		Version:      info.Version,
-		Transport:    transport,
-		Capabilities: effectiveCapabilities(info),
+		Name:      info.Name,
+		Workspace: info.Workspace,
+		OS:        info.OS,
+		Arch:      info.Arch,
+		Version:   info.Version,
+		Transport: transport,
 	}
-}
-
-var legacyCapabilities = []string{
-	"core.exec",
-	"core.jobs",
-	"core.shell",
-	"files.read",
-	"files.write",
-	"files.transfer",
-	"browser",
-}
-
-func effectiveCapabilities(info Info) []string {
-	if len(info.Capabilities) != 0 {
-		return append([]string(nil), info.Capabilities...)
-	}
-	return append([]string(nil), legacyCapabilities...)
-}
-
-func supportsCapability(info Info, capability string) bool {
-	if capability == "" {
-		return true
-	}
-	for _, candidate := range effectiveCapabilities(info) {
-		if candidate == capability {
-			return true
-		}
-	}
-	return false
-}
-
-func (m *Manager) RequireCapability(name, capability string) error {
-	if capability == "" {
-		return nil
-	}
-	session, err := m.resolve(name)
-	if err != nil {
-		return err
-	}
-	if !supportsCapability(session.info, capability) {
-		return fmt.Errorf("%w: %s", ErrCapabilityUnsupported, capability)
-	}
-	return nil
 }
 
 func (m *Manager) resolve(name string) (*Session, error) {

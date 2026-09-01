@@ -179,32 +179,3 @@ func TestFormatFileSearchAndPatch(t *testing.T) {
 		t.Fatalf("unexpected file_patch text: %q", patchText)
 	}
 }
-
-func TestNewDeviceToolCapabilities(t *testing.T) {
-	want := map[string]string{
-		"device_info":          "device.info",
-		"app_list":             "apps.read",
-		"app_launch":           "apps.launch",
-		"screen_capture":       "screen.capture",
-		"ui_dump":              "ui.inspect",
-		"ui_tap":               "ui.input",
-		"android_intent_start": "android.intent",
-	}
-	for tool, capability := range want {
-		if got := requiredCapability(tool); got != capability {
-			t.Fatalf("requiredCapability(%q)=%q, want %q", tool, got, capability)
-		}
-	}
-
-	var intent *toolSpec
-	for _, spec := range toolSpecs() {
-		if spec.Name == "android_intent_start" {
-			copy := spec
-			intent = &copy
-			break
-		}
-	}
-	if intent == nil || intent.Operation != "intent_start" {
-		t.Fatalf("android_intent_start mapping=%+v", intent)
-	}
-}

@@ -5,12 +5,11 @@ import "encoding/json"
 const ProtocolVersion = 3
 
 type Info struct {
-	Name         string   `json:"name"`
-	Workspace    string   `json:"workspace,omitempty"`
-	OS           string   `json:"os"`
-	Arch         string   `json:"arch"`
-	Version      string   `json:"version"`
-	Capabilities []string `json:"capabilities,omitempty"`
+	Name      string `json:"name"`
+	Workspace string `json:"workspace,omitempty"`
+	OS        string `json:"os"`
+	Arch      string `json:"arch"`
+	Version   string `json:"version"`
 }
 
 type helloMessage struct {
