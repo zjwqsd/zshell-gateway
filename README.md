@@ -84,6 +84,53 @@ Core    -> wss://zshell.example.com/device/ws
 
 No additional public device port is required.
 
+## Device capabilities
+
+Protocol v3 device hello messages may include `device.capabilities`. Gateway owns all MCP tool schemas; devices only declare capability IDs. This keeps the tool/security boundary in Gateway while allowing Android, Linux and Windows nodes to expose different native features.
+
+Current capability groups include:
+
+```text
+core.exec
+core.jobs
+core.shell
+files.read
+files.write
+files.transfer
+browser
+device.info
+apps.read
+apps.launch
+apps.stop
+apps.current
+screen.capture
+ui.inspect
+ui.input
+android.intent
+```
+
+`device_list` returns the effective capability list for each live node. Gateway checks the required capability before forwarding an operation and returns `CapabilityUnsupported` locally when the selected node cannot perform it. Older protocol-v3 desktop Cores that omit `capabilities` retain the legacy exec/jobs/shell/files/browser set.
+
+Native-device tools currently registered by Gateway are:
+
+```text
+device_info
+app_list
+app_info
+app_launch
+app_stop
+app_current
+screen_capture
+ui_dump
+ui_tap
+ui_swipe
+ui_text
+ui_keyevent
+android_intent_start
+```
+
+The first group is platform-neutral where a Core implements it. `android_intent_start` remains Android-specific. UI tools are capability-gated rather than assumed on every desktop because Wayland/X11/Windows expose very different automation surfaces.
+
 ## Cross-device file transfer
 
 Gateway exposes three transfer tools:
@@ -100,7 +147,7 @@ file_transfer_cancel
 source Core -> Gateway -> target Core
 ```
 
-All combinations are supported: WebSocket -> WebSocket, WebSocket -> HTTP, HTTP -> WebSocket, and HTTP -> HTTP. WebSocket keeps the existing 256 KiB `ZTF1` binary frames. HTTP file data uses raw `application/octet-stream` requests (currently 1 MiB chunks) with explicit sequence/ack handling.
+All combinations are supported: WebSocket -> WebSocket, WebSocket -> HTTP, HTTP -> WebSocket, and HTTP -> HTTP. WebSocket uses 1 MiB `ZTF1` binary frames. HTTP file data uses raw `application/octet-stream` requests (currently 1 MiB chunks) with explicit sequence/ack handling.
 
 Gateway does not load the whole file into memory, persist it to disk, base64-encode it, or place file bytes in MCP responses. Transport writes/acknowledgements provide backpressure to the source. Control messages remain protocol-v3 JSON messages.
 
